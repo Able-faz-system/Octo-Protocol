@@ -1,0 +1,25 @@
+[package]
+name = "octo-evm-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "EVM (secp256k1) key derivation, EIP-55 addresses, and signing primitives for Octo Protocol"
+publish = false
+
+[dependencies]
+octo-crypto = { path = "../crypto" }
+zeroize = { version = "1", features = ["zeroize_derive"] }
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+hex = "0.4"
+subtle = "2"
+k256 = { version = "0.13", features = ["ecdsa", "arithmetic"] }
+sha3 = "0.10"
+bip32 = { version = "0.5", features = ["secp256k1"] }
+tiny-bip39 = "1"
+
+[dev-dependencies]
+proptest = "1"

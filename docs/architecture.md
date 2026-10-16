@@ -1,79 +1,157 @@
 # Architecture
 
-octo is a Cargo workspace. The guiding rule: **secret material is confined to one crate**
-(`wallet-core`), decrypted only in-memory at signing time, and zeroized immediately after.
+This document records architectural decisions for the Octo Protocol workspace. Each decision is
+recorded as a lightweight ADR (Architecture Decision Record) so that the rationale survives the
+pull request that introduced it.
 
-## Crates
+---
+
+## ADR-001: EVM key handling crate selection (`alloy-primitives` vs `k256` + `sha3` + `bip32`)
+
+**Status:** Accepted (resolves the crate-selection requirement of #217; binds #218, #225, #226)
+
+**Context**
+
+`crates/evm-core` (`octo-evm-core`) must provide secp256k1 key handling, BIP-32/BIP-44 derivation,
+keccak-256 address encoding with EIP-55 checksums, and low-`s` (EIP-2) normalised signing. This
+crate handles secret key material and therefore inherits `wallet-core`'s full lint wall and
+`zeroize`-on-drop discipline.
+
+Two candidate stacks were evaluated:
+
+1. **`alloy-primitives`** (plus the wider `alloy` family) — the Rust Ethereum ecosystem's
+   batteries-included stack. Provides `Address`, `B256`, keccak-256, EIP-55 checksumming, and
+   (via `alloy-signer` / `alloy-signer-local`) signing and derivation.
+2. **`k256` + `sha3` + `bip32`** — a minimal, composable stack: `k256` (RustCrypto secp256k1),
+   `sha3` (RustCrypto keccak-256), and `bip32` (RustCrypto BIP-32 derivation), assembled by us.
+
+**Evaluation criteria**
+
+- **MSRV 1.84.1.** The workspace pins MSRV 1.84.1. The `alloy` family moves quickly and its
+  transitive dependency graph has repeatedly raised its MSRV ahead of the workspace pin; adopting
+  `alloy-primitives` would either force an MSRV bump or require pinning to an older release that
+  drifts from the rest of the ecosystem. The `k256` + `sha3` + `bip32` stack is maintained by
+  RustCrypto, whose crates track a conservative MSRV and are already present in the workspace
+  dependency graph (via `wallet-core`'s use of RustCrypto primitives).
+- **`cargo deny check` (licenses, advisories, bans, sources).** The `alloy` family pulls a large
+  transitive graph (including `ruint`, `alloy-rlp`, `alloy-sol-type-parser`, and, for the signer
+  crates, `coins-bip39` / `coins-bip32`). Each addition is a new license, advisory, and source
+  surface to audit. The `k256` + `sha3` + `bip32` stack is small, already vetted in this
+  workspace, and adds no new license classes. `bip32` is dual-licensed MIT/Apache-2.0, matching
+  the workspace policy.
+- **Secret-material discipline.** We require `zeroize`-on-drop for all secret material and
+  constant-time comparison. `k256`'s `SecretKey` and `NonZeroScalar` implement `Zeroize` and
+  `ConstantTimeEq` directly, and `bip32`'s extended key types expose the raw scalar for us to
+  wrap in `Zeroizing`. `alloy-signer-local`'s key types do not expose the same guarantees at the
+  granularity we need, and its `Signer` trait is oriented around signing arbitrary payloads,
+  which conflicts with our "no raw-bytes signing oracle" posture (see `wallet-core/src/signer.rs`).
+- **Test-vector provenance.** BIP-32's own Test Vectors 1 and 2 are defined against the raw
+  BIP-32 algorithm; `bip32` exposes the intermediate extended keys needed to assert against them
+  directly. `alloy`'s higher-level derivation wrappers hide those intermediates.
+
+**Decision**
+
+Adopt **`k256` + `sha3` + `bip32`** as the EVM key-handling stack for `octo-evm-core`.
+
+- `k256` for secp256k1 key generation, signing, recovery, and low-`s` normalisation.
+- `sha3` for keccak-256 (address derivation and EIP-55 checksumming).
+- `bip32` for BIP-32 extended-key derivation, driven by the existing BIP-39 mnemonic type from
+  `wallet-core`.
+
+`alloy-primitives` is **rejected** for this crate. It may still be used in non-secret-handling
+contexts (e.g. RPC types in a future `evm-rpc` crate) if its MSRV and `cargo deny` profile are
+acceptable there, but it must not be the source of key material or signing.
+
+**Consequences**
+
+- **#218** (transaction building / signing) consumes `octo-evm-core`'s typed signing operations
+  rather than an `alloy` `Signer`. It must not introduce a raw-bytes signing path.
+- **#225** (EVM RPC / provider integration) may use `alloy` types for wire formats, but must
+  convert to `octo-evm-core` types at the boundary and must not route key material through
+  `alloy`.
+- **#226** (EVM integration tests) must pin the same `k256` / `sha3` / `bip32` versions and must
+  not add `alloy-signer-local` as a dev-dependency, to keep the `cargo deny` surface identical
+  between the crate and its tests.
+- Any future proposal to adopt `alloy` for key handling must supersede this ADR and re-run the
+  MSRV and `cargo deny` evaluation.
+
+---
+
+## ADR-002: EVM derivation path and its non-hardened-level security consequence
+
+**Status:** Accepted (resolves the derivation-path requirement of #217; binds #220, #224)
+
+**Context**
+
+`octo-wallet-core` derives Stellar keys via SEP-0005 SLIP-0010 **ed25519** at
+`m/44'/148'/index'` — every level hardened. EVM uses a different curve (secp256k1), a different
+derivation standard (BIP-32/BIP-44), a different coin type (60), and a different address format
+(last 20 bytes of keccak-256 of the uncompressed public key, with an EIP-55 mixed-case checksum).
+
+**Decision**
+
+`octo-evm-core` derives EVM keys at:
 
 ```
-crates/
-  crypto/       AES-256-GCM seal/open of a gas-tank seed (random nonce + salt). No Stellar knowledge.
-  wallet-core/  The only code that touches secret keys (server-side: gas tank only):
-                  - SEP-0005 (SLIP-0010 ed25519) derivation: m/44'/148'/<index>'
-                  - muxed address (M...) encode/decode
-                  - build + sign fee-bump envelopes, then zeroize
-  resilience/   Retry with backoff + circuit breaker for outbound Horizon calls.
-  store/        Postgres models + migrations (sqlx).
-  webhooks/     HMAC-SHA256 signed outbound webhooks with retry + delivery log.
-  ingest/       Horizon payment streaming + durable cursor → deposit detection & attribution.
-  api/          axum REST API (wallets, addresses, submit-signed, sponsorship, webhooks).
-bin/
-  server/       Composes api + ingest into one process (splittable later to scale).
-  migrate-keys/ Offline backfill that re-seals gas-tank seeds under a new master key
-                (zero-downtime rotation; skips client-custody rows, which hold no seed).
+m / 44' / 60' / 0' / 0 / {index}
 ```
 
-## Request flows
+The **purpose**, **coin type**, and **account** levels are hardened (`44'`, `60'`, `0'`). The
+**change** and **address index** levels are **non-hardened** (`0`, `{index}`).
 
-### Create master wallet (non-custodial)
-The **client** generates the BIP39 mnemonic and derives the base keypair (`m/44'/148'/0'`) in the
-browser/SDK. It sends `api` only the public account (`G...`), plus an optional `encrypted_backup`
-blob it encrypted under the user's password. `store` persists the public key, the opaque blob and
-`custody = 'client'` — **no seed, no mnemonic, ever.** On testnet, friendbot funds the account so
-it exists on-chain.
+This matches the de-facto BIP-44 convention for Ethereum and is what allows xpub-based address
+derivation: an extended public key at `m/44'/60'/0'/0` can derive every address index without
+access to the private key.
 
-### Generate a customer address
-`api` atomically increments the wallet's id counter → `wallet-core` encodes a muxed `M...` from
-the base `G...` + id → `store` saves the row. **No on-chain operation.** The response also returns
-the `G...` + numeric-memo fallback for senders that don't support muxed.
+**Security consequence (prominent)**
 
-### Detect a deposit
-`ingest` streams the master account's payments from Horizon (with a persisted cursor). Each
-payment is attributed to a customer by its **muxed id** or **memo id**, recorded as a `deposit`
-transaction, and a signed webhook fires.
+Because the change and index levels are **non-hardened**, the following holds:
 
-For the full contract around cursor resume, dedup, reorg handling, and the quarantine path
-see [`docs/ingest-integration.md`](ingest-integration.md).
+> **A leaked child private key at `m/44'/60'/0'/0/{i}` together with the account xpub at
+> `m/44'/60'/0'/0` compromises every sibling key at `m/44'/60'/0'/0/{j}` for all `j`.**
 
-### Move funds out (client-signed)
-The client fetches `GET /signing-info` (sequence, network passphrase, base fee), builds and
-**signs the transaction locally**, then relays it via `POST /submit-signed`. `api` validates the
-envelope and submits it to Horizon **unmodified** → record + webhook on confirmation. Horizon's
-result codes are passed back so the client can correct and re-sign.
+This is a property of BIP-32 non-hardened derivation, not a bug in our implementation. Given a
+non-hardened child private key `k_i` and the parent chain code, an attacker can recover the parent
+private key `k_par`, and from `k_par` derive every sibling. Hardened levels prevent this because
+the chain code is derived from the private key, not the public key.
 
-The custodial `POST /withdraw` and `POST /trustlines` endpoints are `410 Gone` tombstones.
+This is why the Stellar path is all-hardened and the EVM path is not: the EVM ecosystem's tooling
+(xpub-based address generation, watch-only wallets) depends on the non-hardened tail, and we accept
+the trade-off to remain interoperable.
 
-## Signing safety
+**Consequences**
 
-The user's key is never on the server, so there is no server-side signing path for user funds —
-and therefore no signing oracle to abuse. What `api` does on the submit path is *validate*:
+- **#220** (EVM account management) must treat the account xpub as **secret-equivalent** for the
+  purposes of sibling-key compromise. It must not persist or transmit the xpub alongside any child
+  private key, and must document the compromise property in its own API docs.
+- **#224** (EVM key backup / recovery) must not export a child private key and the account xpub
+  together. If both are needed, the export must be gated behind an explicit, documented warning.
+- `octo-evm-core`'s `derive.rs` must document the non-hardened tail and the sibling-compromise
+  property at the derivation entry point, so that callers cannot miss it.
+- Any future change to harden the change/index levels would break xpub-based derivation and must
+  supersede this ADR.
 
-1. Envelope is a v1 `Tx` (not a fee-bump wrapper smuggled in).
-2. At least one signature is present.
-3. The source account **is this wallet**.
-4. Every operation is on the allowlist (payment / path-payment / change-trust).
-5. Submit verbatim — the server never re-signs or alters the transaction.
+---
 
-### The one server-held key: the gas tank
-Fee sponsorship still needs a server signature, so a wallet may provision a **gas tank**: a
-separate account holding fee float only. Its seed is the only plaintext key material on the
-server, and it is confined to one crate:
+## ADR-003: Chain-scoped AAD for sealed key material
 
-1. Retrieve the encrypted gas-tank seed from `store`.
-2. `crypto::open` decrypts in-memory (AES-256-GCM; tag verifies integrity, network bound as AAD).
-3. `wallet-core` derives the private key via SEP-0005.
-4. Sign **only the outer fee-bump envelope** — the user's inner transaction is untouched.
-5. `zeroize` the seed and key buffers.
+**Status:** Accepted (resolves the sealing-context requirement of #217)
 
-Keys are never written to disk or logs and are never persisted in derived form. Worst-case
-exposure of this key is the gas budget — never customer balances.
+**Context**
+
+`octo-evm-core` reuses `octo-crypto` for sealing key material. We must not add a second encryption
+scheme. A sealed EVM key must not be openable in a Stellar context, and vice versa.
+
+**Decision**
+
+The `context` AAD string passed to `octo-crypto` is chain-scoped, e.g. `"octo:eip155:1"` for
+Ethereum mainnet. Stellar uses its own context string. The AAD is bound into the AEAD, so a
+ciphertext sealed under one context fails authentication under another.
+
+**Consequences**
+
+- `octo-evm-core` must never seal or open key material without an explicit chain-scoped context.
+- A test in `octo-evm-core` asserts that a seed sealed with an `eip155` context **fails** to open
+  with a `stellar` context.
+- Any new chain must define its own context string; reusing another chain's context is a bug.
+</｜｜DSML｜｜ parameter>
