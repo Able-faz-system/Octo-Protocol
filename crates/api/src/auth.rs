@@ -378,8 +378,12 @@ pub async fn login(
         .store()
         .find_user_by_email(&email)
         .await
-        .map_err(|_| ApiError::Internal)?
-        .ok_or_else(|| ApiError::BadRequest("invalid email or password".into()))?;
+        .map_err(|_| ApiError::Internal)?;
+
+    let Some(user) = user else {
+        let _ = verify_password(&password, dummy_password_hash());
+        return Err(ApiError::BadRequest("invalid email or password".into()));
+    };
 
     verify_password(&password, &user.password_hash)
         .map_err(|_| ApiError::BadRequest("invalid email or password".into()))?;
@@ -992,6 +996,18 @@ fn verify_password(password: &str, phc: &str) -> Result<(), ()> {
     Argon2::default()
         .verify_password(password.as_bytes(), &parsed)
         .map_err(|_| ())
+}
+
+fn dummy_password_hash() -> &'static str {
+    static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HASH.get_or_init(|| {
+        hash_password("octo-login-timing-dummy")
+            .expect("constant dummy password must be hashable")
+    })
+}
+
+pub(crate) fn initialize_dummy_password_hash() {
+    let _ = dummy_password_hash();
 }
 
 type HmacSha256 = Hmac<Sha256>;
