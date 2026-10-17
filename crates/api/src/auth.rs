@@ -374,15 +374,47 @@ pub async fn login(
     let creds: Credentials = parse_optional(&body)?;
     let (email, password) = validate(creds)?;
 
+    let invalid_credentials = || ApiError::BadRequest("invalid email or password".into());
+    if state
+        .store()
+        .auth_locked_until(&email)
+        .await
+        .map_err(|_| ApiError::Internal)?
+        .is_some()
+    {
+        return Err(invalid_credentials());
+    }
+
     let user = state
         .store()
         .find_user_by_email(&email)
         .await
-        .map_err(|_| ApiError::Internal)?
-        .ok_or_else(|| ApiError::BadRequest("invalid email or password".into()))?;
+        .map_err(|_| ApiError::Internal)?;
 
-    verify_password(&password, &user.password_hash)
-        .map_err(|_| ApiError::BadRequest("invalid email or password".into()))?;
+    let Some(user) = user else {
+        let synthetic = hash_password("octo-nonexistent-account")?;
+        let _ = verify_password(&password, &synthetic);
+        state
+            .store()
+            .record_auth_failure(&email)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+        return Err(invalid_credentials());
+    };
+
+    if verify_password(&password, &user.password_hash).is_err() {
+        state
+            .store()
+            .record_auth_failure(&email)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+        return Err(invalid_credentials());
+    }
+    state
+        .store()
+        .reset_auth_failures(&email)
+        .await
+        .map_err(|_| ApiError::Internal)?;
 
     // A correct password on an unverified account (pre-existing user, or one who abandoned
     // signup before verifying) re-triggers the same OTP gate signup uses, instead of a token.

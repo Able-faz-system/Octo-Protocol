@@ -82,6 +82,7 @@ impl WebhookSender {
             store,
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap_or_default(),
             retry_policy: default_retry_policy(),
@@ -224,6 +225,10 @@ impl WebhookSender {
         signature: &str,
         body_bytes: &[u8],
     ) -> AttemptOutcome {
+        if !is_safe_delivery_url(&ep.url).await {
+            tracing::warn!(url = %ep.url, "webhook destination resolved to a non-public address");
+            return AttemptOutcome::default();
+        }
         let resp = self
             .http
             .post(&ep.url)
@@ -254,6 +259,38 @@ impl WebhookSender {
             status: Some(status),
             body_snippet: response_snippet(&raw, &[signature, ep.secret.as_str()]),
         }
+    }
+}
+
+/// Re-resolve hostnames immediately before each attempt. This closes registration-to-delivery DNS
+/// rebinding; production egress policy must constrain the remaining resolver-to-connect window.
+async fn is_safe_delivery_url(url: &str) -> bool {
+    if !is_safe_url(url) {
+        return false;
+    }
+    if std::env::var("OCTO_ALLOW_LOCAL_WEBHOOKS").as_deref() == Ok("1") {
+        return true;
+    }
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    if host.trim_matches(['[', ']']).parse::<IpAddr>().is_ok() {
+        return true;
+    }
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    match tokio::net::lookup_host((host, port)).await {
+        Ok(addresses) => {
+            let resolved: Vec<_> = addresses.collect();
+            !resolved.is_empty()
+                && resolved.into_iter().all(|address| match address.ip() {
+                    IpAddr::V4(ip) => is_public_ipv4(ip),
+                    IpAddr::V6(ip) => is_public_ipv6(ip),
+                })
+        }
+        Err(_) => false,
     }
 }
 
