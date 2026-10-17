@@ -48,6 +48,8 @@ A Cargo workspace; all secret-handling is isolated in `wallet-core` and zeroized
 | [`bin/server`](bin/server) | composes `api` + `ingest` into one service |
 
 See [docs/architecture.md](docs/architecture.md).
+The persisted encryption compatibility contract is documented in
+[docs/sealed-seed-versioning.md](docs/sealed-seed-versioning.md).
 
 ## Quickstart
 

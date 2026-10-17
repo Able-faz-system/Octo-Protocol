@@ -17,6 +17,7 @@ use stellar_base::crypto::DalekKeyPair;
 use stellar_base::network::Network;
 // sign_fee_bump (production, not test-gated) rejects sub-minimum fees against this constant.
 use stellar_base::transaction::MIN_BASE_FEE;
+use zeroize::Zeroizing;
 
 // validate_change_trust (production) checks the issuer strkey.
 use crate::address::is_valid_account;
@@ -137,15 +138,24 @@ pub struct SignedPayment {
 
 /// Open a sealed seed for `network`, derive Stellar account `account_index`, and return its
 /// `DalekKeyPair`. The decrypted seed is zeroized as it leaves scope.
+fn derived_secret_from_sealed(
+    master_key: &[u8; MASTER_KEY_LEN],
+    sealed: &SealedSeed,
+    network: StellarNetwork,
+    account_index: u32,
+) -> Result<Zeroizing<[u8; 32]>, WalletError> {
+    let seed_bytes = open(master_key, sealed, network.crypto_context())?;
+    let seed = WalletSeed::from_bytes(seed_bytes.to_vec())?;
+    seed.derive_ed25519_secret(account_index)
+}
+
 fn keypair_from_sealed(
     master_key: &[u8; MASTER_KEY_LEN],
     sealed: &SealedSeed,
     network: StellarNetwork,
     account_index: u32,
 ) -> Result<DalekKeyPair, WalletError> {
-    let seed_bytes = open(master_key, sealed, network.crypto_context())?;
-    let seed = WalletSeed::from_bytes(seed_bytes.to_vec())?;
-    let secret = seed.derive_ed25519_secret(account_index)?;
+    let secret = derived_secret_from_sealed(master_key, sealed, network, account_index)?;
     // stellar-base builds the ed25519 keypair from the 32-byte secret seed.
     DalekKeyPair::from_seed_bytes(secret.as_ref()).map_err(|_| WalletError::KeyDerivation)
 }
@@ -379,9 +389,7 @@ pub fn sign_fee_bump(
     let inner_v1 = parse_inner_v1(req.inner_xdr)?;
 
     // Derive the signing key for the fee source (decrypt → derive → zeroize on drop).
-    let seed_bytes = open(master_key, sealed, network.crypto_context())?;
-    let seed = WalletSeed::from_bytes(seed_bytes.to_vec())?;
-    let secret = seed.derive_ed25519_secret(account_index)?;
+    let secret = derived_secret_from_sealed(master_key, sealed, network, account_index)?;
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&secret);
 
     let pk_bytes: [u8; 32] = signing_key.verifying_key().to_bytes();
@@ -738,6 +746,45 @@ mod tests {
         };
         assert!(matches!(
             sign_payment(&mk, &sealed, StellarNetwork::Testnet, 0, &req),
+            Err(WalletError::SeedDecryption)
+        ));
+    }
+
+    #[test]
+    fn every_sealed_seed_operation_rejects_cross_network_use() {
+        let (master_key, sealed) = sealed_vector_seed(StellarNetwork::Public);
+
+        assert!(matches!(
+            account_id_from_sealed(&master_key, &sealed, StellarNetwork::Testnet, 0),
+            Err(WalletError::SeedDecryption)
+        ));
+
+        let payment = PaymentRequest {
+            destination: DEST,
+            stroops: 1,
+            asset: None,
+            memo_id: None,
+            sequence: 1,
+        };
+        assert!(matches!(
+            sign_payment(&master_key, &sealed, StellarNetwork::Testnet, 0, &payment),
+            Err(WalletError::SeedDecryption)
+        ));
+
+        let trustline = ChangeTrustRequest {
+            asset_code: "USDC",
+            asset_issuer: DEST,
+            limit_stroops: None,
+            sequence: 1,
+        };
+        assert!(matches!(
+            sign_change_trust(
+                &master_key,
+                &sealed,
+                StellarNetwork::Testnet,
+                0,
+                &trustline,
+            ),
             Err(WalletError::SeedDecryption)
         ));
     }

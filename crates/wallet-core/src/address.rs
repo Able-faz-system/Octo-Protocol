@@ -399,6 +399,35 @@ mod tests {
         assert!(verify_account_signature(&account, msg, "AAAA").is_err());
     }
 
+    #[test]
+    fn verify_account_signature_rejects_malleated_signatures() {
+        use base64::Engine as _;
+        use ed25519_dalek::Signer as _;
+
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        let account = format!("{}", PublicKey(signing.verifying_key().to_bytes()));
+        let message = b"octo strict signature verification";
+        let original = signing.sign(message).to_bytes();
+
+        for index in [0usize, 31, 32, 63] {
+            let mut changed = original;
+            changed[index] ^= 0x80;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(changed);
+            assert!(matches!(
+                verify_account_signature(&account, message, &encoded),
+                Err(WalletError::InvalidSignature)
+            ));
+        }
+
+        let mut non_canonical_scalar = original;
+        non_canonical_scalar[63] |= 0xe0;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(non_canonical_scalar);
+        assert!(matches!(
+            verify_account_signature(&account, message, &encoded),
+            Err(WalletError::InvalidSignature)
+        ));
+    }
+
     // -----------------------------------------------------------------------
     // Proptest cross-validation: is_valid_account vs stellar-strkey's decoder
     //
