@@ -44,7 +44,7 @@ use crate::state::AppState;
 use argon2::password_hash::{
     rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
 };
-use argon2::Argon2;
+use argon2::{Algorithm, Argon2, Params, Version};
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -154,6 +154,8 @@ pub struct Claims {
     /// default), so they stay valid until the user's first password change.
     #[serde(default)]
     pub epoch: i32,
+    pub iss: String,
+    pub aud: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -230,31 +232,38 @@ pub async fn signup(
     let (email, password) = validate(creds)?;
 
     let hash = hash_password(&password)?;
-    let user = state
-        .store()
-        .create_user(&email, &hash)
-        .await
-        .map_err(|e| match e {
-            octo_store::StoreError::Conflict => {
-                ApiError::BadRequest("email already registered".into())
-            }
-            _ => ApiError::Internal,
-        })?;
+    let (user, created) = match state.store().create_user(&email, &hash).await {
+        Ok(user) => (user, true),
+        Err(octo_store::StoreError::Conflict) => {
+            let user = state
+                .store()
+                .find_user_by_email(&email)
+                .await
+                .map_err(|_| ApiError::Internal)?
+                .ok_or(ApiError::Internal)?;
+            (user, false)
+        }
+        Err(_) => return Err(ApiError::Internal),
+    };
 
-    crate::audit::record(
-        &state,
-        user.id,
-        "created an account",
-        crate::audit::category::AUTH,
-        None,
-        &headers,
-    )
-    .await;
+    if created {
+        crate::audit::record(
+            &state,
+            user.id,
+            "created an account",
+            crate::audit::category::AUTH,
+            None,
+            &headers,
+        )
+        .await;
+    }
 
     // If the OTP email can't be sent, this account is otherwise unreachable — delete it rather
     // than leaving the email permanently stuck as "already registered" with no way to verify.
     if let Err(e) = issue_signup_otp(&state, user.id, &user.email).await {
-        let _ = state.store().delete_unverified_user(user.id).await;
+        if created {
+            let _ = state.store().delete_unverified_user(user.id).await;
+        }
         return Err(e);
     }
 
@@ -383,6 +392,14 @@ pub async fn login(
 
     verify_password(&password, &user.password_hash)
         .map_err(|_| ApiError::BadRequest("invalid email or password".into()))?;
+    if password_hash_needs_upgrade(&user.password_hash) {
+        let upgraded = hash_password(&password)?;
+        state
+            .store()
+            .rehash_password(user.id, &upgraded)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+    }
 
     // A correct password on an unverified account (pre-existing user, or one who abandoned
     // signup before verifying) re-triggers the same OTP gate signup uses, instead of a token.
@@ -508,12 +525,12 @@ pub async fn change_password(
     let req: ChangePasswordRequest = parse_optional(&body)?;
     let current = req
         .current_password
-        .filter(|p| !p.is_empty())
+        .filter(|password| !password.is_empty() && password.len() <= 128)
         .ok_or_else(|| ApiError::BadRequest("current_password is required".into()))?;
     let new = req
         .new_password
-        .filter(|p| p.len() >= 8)
-        .ok_or_else(|| ApiError::BadRequest("new_password must be at least 8 characters".into()))?;
+        .filter(|password| (8..=128).contains(&password.len()))
+        .ok_or_else(|| ApiError::BadRequest("new_password must be 8-128 bytes".into()))?;
     if new == current {
         return Err(ApiError::BadRequest(
             "new_password must differ from the current password".into(),
@@ -743,7 +760,7 @@ pub async fn request_email_change(
     let new_email = normalize_email(req.new_email)?;
     let password = req
         .password
-        .filter(|p| !p.is_empty())
+        .filter(|password| !password.is_empty() && password.len() <= 128)
         .ok_or_else(|| ApiError::BadRequest("password is required".into()))?;
 
     // Per-account cap: bounds password guessing with a stolen session, and OTP mail to third parties.
@@ -924,8 +941,8 @@ fn validate(creds: Credentials) -> Result<(String, String), ApiError> {
     let email = normalize_email(creds.email)?;
     let password = creds
         .password
-        .filter(|p| p.len() >= 8)
-        .ok_or_else(|| ApiError::BadRequest("password must be at least 8 characters".into()))?;
+        .filter(|password| (8..=128).contains(&password.len()))
+        .ok_or_else(|| ApiError::BadRequest("password must be 8-128 bytes".into()))?;
     Ok((email, password))
 }
 
@@ -981,7 +998,7 @@ pub fn validate_jwt_secret(secret: &[u8]) -> Result<(), String> {
 
 fn hash_password(password: &str) -> Result<String, ApiError> {
     let salt = SaltString::generate(&mut OsRng);
-    Argon2::default()
+    configured_argon2()?
         .hash_password(password.as_bytes(), &salt)
         .map(|h| h.to_string())
         .map_err(|_| ApiError::Internal)
@@ -989,13 +1006,45 @@ fn hash_password(password: &str) -> Result<String, ApiError> {
 
 fn verify_password(password: &str, phc: &str) -> Result<(), ()> {
     let parsed = PasswordHash::new(phc).map_err(|_| ())?;
-    Argon2::default()
+    configured_argon2().map_err(|_| ())?
         .verify_password(password.as_bytes(), &parsed)
         .map_err(|_| ())
 }
 
+fn configured_argon2() -> Result<Argon2<'static>, ApiError> {
+    let parse = |name: &str, default: u32| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    };
+    let params = Params::new(
+        parse("ARGON2_MEMORY_KIB", 65_536),
+        parse("ARGON2_ITERATIONS", 3),
+        parse("ARGON2_PARALLELISM", 1),
+        None,
+    )
+    .map_err(|_| ApiError::Internal)?;
+    Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params))
+}
+
+fn password_hash_needs_upgrade(phc: &str) -> bool {
+    let memory = std::env::var("ARGON2_MEMORY_KIB").unwrap_or_else(|_| "65536".into());
+    let iterations = std::env::var("ARGON2_ITERATIONS").unwrap_or_else(|_| "3".into());
+    let parallelism = std::env::var("ARGON2_PARALLELISM").unwrap_or_else(|_| "1".into());
+    !phc.contains(&format!("m={memory},t={iterations},p={parallelism}"))
+}
+
 type HmacSha256 = Hmac<Sha256>;
 const JWT_HEADER_B64: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
+
+fn jwt_issuer() -> String {
+    std::env::var("JWT_ISSUER").unwrap_or_else(|_| "octo-api".into())
+}
+
+fn jwt_audience() -> String {
+    std::env::var("JWT_AUDIENCE").unwrap_or_else(|_| "octo-clients".into())
+}
 
 fn b64(input: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(input)
@@ -1012,7 +1061,9 @@ fn issue_token(secret: &[u8], user_id: Uuid, session_epoch: i32) -> Result<Strin
         sub: user_id.to_string(),
         exp: now_secs() + TOKEN_TTL_SECS,
         jti: Uuid::new_v4().to_string(),
-fn issue_token(secret: &[u8], user_id: Uuid, session_epoch: i32) -> Result<String, ApiError> {
+        epoch: session_epoch,
+        iss: jwt_issuer(),
+        aud: jwt_audience(),
     };
     let payload = serde_json::to_vec(&claims).map_err(|_| ApiError::Internal)?;
     let signing_input = format!("{JWT_HEADER_B64}.{}", b64(&payload));
@@ -1034,7 +1085,7 @@ pub fn verify_token(secret: &[u8], token: &str) -> Option<Claims> {
         return None;
     }
     let claims: Claims = serde_json::from_slice(&b64_decode(payload)?).ok()?;
-    if claims.exp < now_secs() {
+    if claims.exp < now_secs() || claims.iss != jwt_issuer() || claims.aud != jwt_audience() {
         return None;
     }
     Some(claims)
@@ -1119,7 +1170,7 @@ pub async fn authenticate(
         .get_session_epoch(user_id)
         .await
         .map_err(|_| ApiError::Internal)?;
-    if epoch != Some(claims.ep) {
+    if epoch != Some(claims.epoch) {
         return Err(ApiError::Unauthorized);
     }
 
@@ -1211,7 +1262,9 @@ mod tests {
             sub: user_id.to_string(),
             exp,
             jti: Uuid::new_v4().to_string(),
-            exp: 0,
+            epoch: 0,
+            iss: jwt_issuer(),
+            aud: jwt_audience(),
         };
         let payload = serde_json::to_vec(&claims).expect("Claims always serialize");
         let signing_input = format!("{JWT_HEADER_B64}.{}", b64(&payload));
@@ -1284,14 +1337,14 @@ mod tests {
         // signature segment is irrelevant here: verify_token must reject on the header check
         // alone, before ever reaching signature verification.
         let none_header = b64(br#"{"alg":"none","typ":"JWT"}"#);
-        assert_ne!(none_header, JWT_HEADER_B64);
+        assert_ne!(none_header, parts[0]);
         let tampered = format!("{}.{}.{}", none_header, parts[1], parts[2]);
         assert!(verify_token(SECRET, &tampered).is_none());
 
         // Also confirm a header that isn't even valid JSON (garbage bytes) is rejected the
         // same way, and doesn't panic.
         let garbage_header = b64(b"not-a-jwt-header");
-        assert_ne!(garbage_header, JWT_HEADER_B64);
+        assert_ne!(garbage_header, parts[0]);
         let tampered = format!("{}.{}.{}", garbage_header, parts[1], parts[2]);
         assert!(verify_token(SECRET, &tampered).is_none());
 

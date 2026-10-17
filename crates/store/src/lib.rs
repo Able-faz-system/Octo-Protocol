@@ -326,6 +326,15 @@ impl Store {
         Ok(row)
     }
 
+    pub async fn rehash_password(&self, user_id: Uuid, password_hash: &str) -> Result<(), StoreError> {
+        sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
+            .bind(user_id)
+            .bind(password_hash)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Look up the wallet that owns a key by its hash (for API-key authentication later).
     pub async fn wallet_id_for_key_hash(&self, key_hash: &str) -> Result<Option<Uuid>, StoreError> {
         let row: Option<(Uuid,)> =
