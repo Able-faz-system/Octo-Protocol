@@ -6,6 +6,7 @@
 
 use axum::http::HeaderMap;
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -59,21 +60,56 @@ impl RateLimiter {
     }
 }
 
-/// Best-effort client IP: first hop of `X-Forwarded-For` (set by a fronting proxy), else the
-/// socket peer address, else a shared fallback key (still rate-limited, just collectively).
-pub fn client_ip(headers: &HeaderMap, peer: Option<std::net::SocketAddr>) -> String {
-    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        if let Some(first) = xff.split(',').next() {
-            let first = first.trim();
-            if !first.is_empty() {
-                return first.to_string();
-            }
+fn ip_in_cidr(ip: IpAddr, cidr: &str) -> bool {
+    let (network, prefix) = match cidr.trim().split_once('/') {
+        Some((network, prefix)) => (network, prefix.parse::<u32>().ok()),
+        None => return cidr.trim().parse::<IpAddr>().ok() == Some(ip),
+    };
+    let Some(prefix) = prefix else { return false };
+    match (ip, network.parse::<IpAddr>().ok()) {
+        (IpAddr::V4(ip), Some(IpAddr::V4(network))) if prefix <= 32 => {
+            let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+            u32::from(ip) & mask == u32::from(network) & mask
         }
+        (IpAddr::V6(ip), Some(IpAddr::V6(network))) if prefix <= 128 => {
+            let mask = if prefix == 0 { 0 } else { u128::MAX << (128 - prefix) };
+            u128::from(ip) & mask == u128::from(network) & mask
+        }
+        _ => false,
     }
-    match peer {
-        Some(addr) => addr.ip().to_string(),
-        None => "unknown".to_string(),
+}
+
+fn is_trusted_proxy(ip: IpAddr) -> bool {
+    std::env::var("TRUSTED_PROXY_CIDRS")
+        .ok()
+        .is_some_and(|value| value.split(',').any(|cidr| ip_in_cidr(ip, cidr)))
+}
+
+/// Resolve the client address while honoring forwarding headers only from configured proxies.
+pub fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
+    let Some(peer_ip) = peer.map(|addr| addr.ip()) else {
+        return "unknown".to_string();
+    };
+    if !is_trusted_proxy(peer_ip) {
+        return peer_ip.to_string();
     }
+
+    let Some(xff) = headers.get("x-forwarded-for").and_then(|value| value.to_str().ok()) else {
+        return peer_ip.to_string();
+    };
+    let forwarded: Option<Vec<IpAddr>> = xff
+        .split(',')
+        .map(|value| value.trim().parse::<IpAddr>().ok())
+        .collect();
+    let Some(forwarded) = forwarded else {
+        return peer_ip.to_string();
+    };
+    forwarded
+        .into_iter()
+        .rev()
+        .find(|ip| !is_trusted_proxy(*ip))
+        .unwrap_or(peer_ip)
+        .to_string()
 }
 
 #[cfg(test)]
@@ -105,14 +141,17 @@ mod tests {
     }
 
     #[test]
-    fn client_ip_prefers_forwarded_header() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", "9.9.9.9, 10.0.0.1".parse().unwrap());
-        assert_eq!(client_ip(&headers, None), "9.9.9.9");
-
+    fn client_ip_uses_socket_peer_without_a_trusted_proxy() {
         let empty = HeaderMap::new();
         let peer = "127.0.0.1:5000".parse().ok();
         assert_eq!(client_ip(&empty, peer), "127.0.0.1");
         assert_eq!(client_ip(&empty, None), "unknown");
+    }
+
+    #[test]
+    fn cidr_matching_supports_ipv4_and_ipv6() {
+        assert!(ip_in_cidr("10.2.3.4".parse().unwrap(), "10.0.0.0/8"));
+        assert!(!ip_in_cidr("11.2.3.4".parse().unwrap(), "10.0.0.0/8"));
+        assert!(ip_in_cidr("2001:db8::1".parse().unwrap(), "2001:db8::/32"));
     }
 }

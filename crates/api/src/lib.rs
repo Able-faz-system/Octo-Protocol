@@ -19,15 +19,15 @@ pub use error::{ApiError, ApiResult, Envelope};
 pub use state::AppState;
 
 use axum::extract::{DefaultBodyLimit, Request, State};
-use axum::http::header::HeaderName;
-use axum::http::StatusCode;
+use axum::http::header::{self, HeaderName};
+use axum::http::{Method, StatusCode};
 use axum::http::HeaderValue;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use std::time::Duration;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::Instrument;
 
 /// Canonical header name for request correlation IDs.
@@ -66,6 +66,24 @@ pub async fn request_id_middleware(mut req: Request, next: Next) -> Response {
     response
 }
 
+async fn security_headers_middleware(req: Request, next: Next) -> Response {
+    let mut response = next.run(req).await;
+    let headers = response.headers_mut();
+    headers.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+    headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    headers.insert(
+        "content-security-policy",
+        HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
+    );
+    if std::env::var("ENABLE_HSTS").as_deref() == Ok("1") {
+        headers.insert(
+            "strict-transport-security",
+            HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        );
+    }
+    response
+}
+
 /// Keep API request payloads bounded to a deliberate, documented ceiling.
 ///
 /// These routes deserialize JSON from raw `Bytes`; a `Bytes` extractor alone would otherwise
@@ -82,10 +100,27 @@ pub const OUTBOUND_ROUTE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Build the API router with shared state.
 pub fn build_router(state: AppState) -> Router {
+    let allowed_origins: Vec<HeaderValue> = std::env::var("ALLOWED_ORIGINS")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|origin| origin.trim().parse().ok())
+        .collect();
     let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_origin(AllowOrigin::list(allowed_origins))
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::ACCEPT,
+            REQUEST_ID_HEADER.clone(),
+        ]);
 
     // NOTE: the body-limit layer used to be applied here, to an *empty* router — layers only
     // affect routes added before them, so it covered nothing. It is now applied at the end,
@@ -257,6 +292,7 @@ pub fn build_router(state: AppState) -> Router {
         // cleanly with `Router::layer` here.
         .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT))
         .layer(cors)
+        .layer(middleware::from_fn(security_headers_middleware))
         .layer(middleware::from_fn(request_id_middleware))
         .with_state(state)
 }
