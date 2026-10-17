@@ -257,7 +257,6 @@ impl AppState {
             .into_iter()
             .chain(std::iter::once(&*self.inner.master_key))
     }
-    }
 
     pub fn jwt_secret(&self) -> &[u8] {
         &self.inner.jwt_secret

@@ -35,4 +35,8 @@ pub enum CryptoError {
     /// before it can be opened.
     #[error("unknown sealed-seed scheme version: {0}")]
     UnknownScheme(u8),
+
+    /// The boot-time [`crate::self_test`] failed. Names the failing stage, never any bytes.
+    #[error("crypto self-test failed: {0}")]
+    SelfTestFailed(&'static str),
 }

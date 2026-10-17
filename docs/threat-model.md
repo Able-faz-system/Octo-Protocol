@@ -84,8 +84,8 @@ responsible for the largest share of real-world crypto theft.
 ### E. Web2 backend surface  *(the unglamorous majority of real breaches)*
 | Threat | Defense | Step |
 |---|---|---|
-| SQL injection | `sqlx` parameterized queries only; no string-built SQL | 5 |
-| AuthN/AuthZ bypass | Dashboard JWT **or** per-wallet API key, with per-route authorization. Sensitive actions (gas-tank provisioning, key-backup read, API-key management) require a JWT and reject API keys | 6 |
+| SQL injection | `sqlx` parameterized queries only; no string-built SQL. Blast radius limited by a non-owner runtime role with DML only ([postgres-roles.md](postgres-roles.md)) | 5 |
+| AuthN/AuthZ bypass | Dashboard JWT **or** per-wallet API key, with per-route authorization. Sensitive actions (gas-tank provisioning, key-backup read, API-key management) require a JWT and reject API keys. Key-backup reads are rate-limited per user (5/hour) and refuse to serve without writing an audit row | 6 |
 | Stolen session token stays valid | Tokens carry a unique `jti`; `logout` **and** `refresh` deny-list the presented token, and every authenticated request checks the deny-list. (Refresh previously re-issued without revoking, and could even return a byte-identical token) | 6 |
 | SSRF via webhook/Horizon URLs | `is_safe_url` blocks loopback, private, link-local and carrier-grade-NAT targets — IPv4 **and bracketed IPv6** (a naive `:`-split previously let `[fe80::1]` through) | 9 |
 | Webhook forgery / tampering | Outbound webhooks **HMAC-SHA256 signed**; consumers verify. Inbound (if any) verified | 9 |
@@ -100,7 +100,8 @@ responsible for the largest share of real-world crypto theft.
 |---|---|---|
 | Unsafe Rust memory bugs | `#![forbid(unsafe_code)]` in every crate (already set) | 2 ✓ |
 | Panics that crash or leak | `clippy::unwrap_used`/`expect_used` denied in `wallet-core`; errors propagated | 3, 4 |
-| No audit trail | Append-only transaction + webhook-delivery logs | 5, 9 |
+| No audit trail | Append-only transaction + webhook-delivery logs; `audit_logs` UPDATE/DELETE/TRUNCATE blocked by DB triggers (`0026`) | 5, 9 |
+| Wrong master key / broken RNG discovered only at first signature | Startup self-test (`octo_api::self_test`): canary seal/open + RNG sanity per key, then opens the newest stored sealed row; any failure aborts boot | 4 |
 | Disaster recovery (user wallet) | **The user's responsibility, by design.** Recovery is via their BIP39 mnemonic, or the password-encrypted backup blob octo stores but cannot read. octo has no ability to recover a wallet whose owner has lost both | cutover |
 | Disaster recovery (gas tank) | Gas-tank seeds are server-held and covered by DB backup + master-key rotation (`bin/migrate-keys`) | rotation |
 | Schema migrations silently not applied | sqlx keys migrations by version number, so two files sharing a version means only one ever runs. A test pins the exact applied version set — this had already happened five times before it was caught | 5 |

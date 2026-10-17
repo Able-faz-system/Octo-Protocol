@@ -1,0 +1,48 @@
+# Least-privilege Postgres for octo (issue #439). See docs/postgres-roles.md.
+#
+#   docker compose -f docs/examples/docker-compose.least-privilege.yml up -d db
+#   DATABASE_URL=postgres://octo_migrator:migrator-dev-only@localhost:5433/octo \
+#     cargo run -p octo-server -- --migrate-only
+#   docker compose -f docs/examples/docker-compose.least-privilege.yml run --rm roles   # narrow grants
+#   DATABASE_URL=postgres://octo_app:app-dev-only@localhost:5433/octo RUN_MIGRATIONS=false \
+#     cargo run -p octo-server
+#
+# Passwords below are local-dev placeholders; supply real ones from your secret store elsewhere.
+x-db-env: &db-env
+  OCTO_MIGRATOR_PASSWORD: migrator-dev-only
+  OCTO_APP_PASSWORD: app-dev-only
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      <<: *db-env
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres-dev-only
+      POSTGRES_DB: octo
+    ports:
+      - "5433:5432"
+    volumes:
+      # Runs once on an empty data dir: creates octo_migrator, octo_app, octo_audit_retention.
+      - ../../scripts/db/init-roles.sh:/docker-entrypoint-initdb.d/10-octo-roles.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d octo"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Re-run after migrating so table-specific REVOKEs (audit_logs, _sqlx_migrations) apply.
+  roles:
+    image: postgres:17-alpine
+    environment:
+      <<: *db-env
+      PGHOST: db
+      PGUSER: postgres
+      PGPASSWORD: postgres-dev-only
+      PGDATABASE: octo
+    volumes:
+      - ../../scripts/db/init-roles.sh:/init-roles.sh:ro
+    entrypoint: ["bash", "/init-roles.sh"]
+    depends_on:
+      db: { condition: service_healthy }
+    profiles: ["ops"]

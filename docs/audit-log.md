@@ -2,7 +2,14 @@
 
 `GET /v1/audit-logs` returns the signed-in user's account activity (see [api.md](api.md)). Rows are
 written by `crate::audit::record` in `crates/api/src/audit.rs`. Recording is **best-effort**: a
-failure is logged and never fails the request that triggered it.
+failure is logged and never fails the request that triggered it. The exception is
+`crate::audit::record_strict`, used where an untraced access is unacceptable (seed-backup
+retrieval): if the row can't be written the request fails with 500 and nothing is returned.
+
+The table is **append-only at the database level** (migration `0026_audit_logs_append_only.sql`):
+`UPDATE`, `DELETE` and `TRUNCATE` raise unless the session's role is a member of
+`octo_audit_retention`, or the delete is the `ON DELETE CASCADE` from a user row that is already
+gone. See [postgres-roles.md](postgres-roles.md) for who holds that role.
 
 ## Categories
 
@@ -23,7 +30,7 @@ Two constants share the wire value `wallet`, so filtering by `wallet` returns bo
 
 ## Call sites
 
-Every `crate::audit::record` call in `crates/api/src` (13 in total):
+Every `crate::audit::record` / `record_strict` call in `crates/api/src` (14 in total):
 
 | Category | Action text | Emitted from | Trigger |
 |---|---|---|---|
@@ -32,6 +39,7 @@ Every `crate::audit::record` call in `crates/api/src` (13 in total):
 | `authentication` | `refreshed session token` | `auth.rs` `refresh` | `POST /v1/auth/refresh` |
 | `authentication` | `logged out` | `auth.rs` `logout` | `POST /v1/auth/logout` |
 | `wallet` | `created master wallet` | `routes/wallets.rs` `create_wallet` | `POST /v1/wallets` |
+| `wallet` | `retrieved encrypted seed backup` (target: wallet id; strict) | `routes/wallets.rs` `get_backup` | `GET /v1/wallets/{id}/backup` — also rate-limited to 5/hour per user |
 | `wallet` | `provisioned a gas tank` | `routes/wallets.rs` `create_gas_tank` | `POST /v1/wallets/{id}/gas-tank` |
 | `wallet` | `submitted a signed transaction (<status>)` | `routes/submit.rs` `submit_signed` | `POST /v1/wallets/{id}/submit-signed`, only when called with a dashboard JWT |
 | `wallet` | `confirmed a withdrawal (<status>)` | `routes/submit.rs` `withdraw_confirm` | `POST /v1/wallets/{id}/withdraw/confirm` |
@@ -41,7 +49,7 @@ Every `crate::audit::record` call in `crates/api/src` (13 in total):
 | `sponsorship` | `sponsored a transaction (<status>)` | `routes/sponsor.rs` `sponsor` | `POST /v1/wallets/{id}/sponsor`, only when called with a dashboard JWT |
 | `sponsorship` | `updated sponsorship config (enabled: <bool>)` | `routes/sponsorship.rs` `put_config` | `PUT /v1/wallets/{id}/sponsorship` |
 
-To re-verify this table is exhaustive: `grep -rn "audit::record" crates/api/src`.
+To re-verify this table is exhaustive: `grep -rn "audit::record" crates/api/src` (matches `record_strict` too).
 
 ## Keeping the lists in sync
 

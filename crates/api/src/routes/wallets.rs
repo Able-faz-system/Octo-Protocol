@@ -351,10 +351,31 @@ pub async fn get_backup(
     headers: HeaderMap,
 ) -> ApiResult<Json<Envelope<BackupView>>> {
     let user_id = crate::auth::require_login(&headers, &state).await?;
+    // Per-user (not per-IP) so a stolen session can't sidestep the cap by rotating addresses.
+    if !state.rate_limiter().check(
+        &format!("backup:{user_id}"),
+        "backup",
+        crate::rate_limit::BACKUP_USER_LIMIT,
+        crate::rate_limit::BACKUP_USER_WINDOW,
+    ) {
+        return Err(ApiError::TooManyRequests(
+            "too many backup requests — wait a while and try again".into(),
+        ));
+    }
     let wallet = state.store().get_wallet(id).await?;
     if wallet.user_id != Some(user_id) {
         return Err(ApiError::NotFound);
     }
+    // Fail closed: the sealed seed is never handed out without a trace. Target is the id only.
+    crate::audit::record_strict(
+        &state,
+        user_id,
+        crate::audit::action::BACKUP_RETRIEVED,
+        crate::audit::category::WALLET,
+        Some(&wallet.id.to_string()),
+        &headers,
+    )
+    .await?;
     Ok(Envelope::ok(BackupView {
         wallet_id: wallet.id,
         encrypted_backup: wallet.encrypted_backup,

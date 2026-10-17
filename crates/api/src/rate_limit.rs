@@ -29,6 +29,9 @@ pub const PAY_SIGNING_INFO_LIMIT: u32 = 60;
 pub const PAY_SIGNING_INFO_WINDOW: Duration = Duration::from_secs(60);
 pub const PAY_SUBMIT_LIMIT: u32 = 20;
 pub const PAY_SUBMIT_WINDOW: Duration = Duration::from_secs(60);
+// Seed-backup retrieval: legitimate use is a rare new-device recovery, so keep this tight.
+pub const BACKUP_USER_LIMIT: u32 = 5;
+pub const BACKUP_USER_WINDOW: Duration = Duration::from_secs(3600);
 
 /// Bucket key: the client IP plus the endpoint class it is being limited against.
 type BucketKey = (String, &'static str);

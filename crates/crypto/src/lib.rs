@@ -300,6 +300,51 @@ pub fn reseal_with_account_id(
     seal_with_account_id(new_key, plaintext.as_ref(), context, account_id)
 }
 
+/// Domain separator for the self-test canary, so it can never be confused with a real record.
+const SELF_TEST_CONTEXT: &[u8] = b"octo:self-test";
+/// Length of the random canary sealed by [`self_test`].
+const CANARY_LEN: usize = 32;
+
+/// Boot-time check that the OS entropy source and the seal/open round-trip work under
+/// `master_key`, so a broken RNG or degenerate key fails at startup rather than at first use.
+///
+/// Rejects an all-zero key, draws two random canaries (a stuck RNG would repeat), seals one,
+/// opens it, and confirms a foreign context is rejected. Canaries are zeroized on drop.
+pub fn self_test(master_key: &[u8; MASTER_KEY_LEN]) -> Result<(), CryptoError> {
+    if master_key.iter().all(|b| *b == 0) {
+        return Err(CryptoError::SelfTestFailed("master key is all zero bytes"));
+    }
+
+    let mut canary = Zeroizing::new([0u8; CANARY_LEN]);
+    let mut probe = Zeroizing::new([0u8; CANARY_LEN]);
+    OsRng
+        .try_fill_bytes(canary.as_mut())
+        .and_then(|()| OsRng.try_fill_bytes(probe.as_mut()))
+        .map_err(|_| CryptoError::SelfTestFailed("entropy source unavailable"))?;
+    // Two independent 256-bit draws are equal or all-zero only if the RNG is broken.
+    if *canary == *probe || canary.iter().all(|b| *b == 0) {
+        return Err(CryptoError::SelfTestFailed("entropy source returned degenerate output"));
+    }
+
+    let sealed = seal(master_key, canary.as_ref(), SELF_TEST_CONTEXT)
+        .map_err(|_| CryptoError::SelfTestFailed("seal failed"))?;
+    if sealed.ciphertext.get(..CANARY_LEN) == Some(canary.as_slice()) {
+        return Err(CryptoError::SelfTestFailed("ciphertext equals plaintext"));
+    }
+
+    let opened = open(master_key, &sealed, SELF_TEST_CONTEXT)
+        .map_err(|_| CryptoError::SelfTestFailed("open failed"))?;
+    if opened.as_slice() != canary.as_slice() {
+        return Err(CryptoError::SelfTestFailed("round-trip mismatch"));
+    }
+
+    // AEAD must authenticate the context; a foreign one opening would mean AAD is ignored.
+    if open(master_key, &sealed, b"octo:self-test:foreign").is_ok() {
+        return Err(CryptoError::SelfTestFailed("foreign context was accepted"));
+    }
+    Ok(())
+}
+
 /// Convenience: parse a 32-byte master key from a byte slice (e.g. decoded from a KMS/env value).
 pub fn master_key_from_slice(bytes: &[u8]) -> Result<[u8; MASTER_KEY_LEN], CryptoError> {
     bytes.try_into().map_err(|_| CryptoError::InvalidMasterKeyLength {
