@@ -1,6 +1,6 @@
 //! Gas sponsorship configuration: enable/disable sponsorship and set spend controls.
 
-use crate::auth::authorize_wallet;
+use crate::auth::{authorize_wallet, authorize_wallet_scope};
 use crate::error::{ApiError, ApiResult, Envelope};
 use crate::json::parse_optional;
 use crate::state::AppState;
@@ -69,7 +69,7 @@ pub async fn put_config(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Json<Envelope<SponsorshipConfigView>>> {
-    authorize_wallet(&headers, &state, wallet_id).await?;
+    authorize_wallet_scope(&headers, &state, wallet_id, "sponsor").await?;
     let wallet = state.store().get_wallet(wallet_id).await?;
     if wallet.is_archived() {
         return Err(ApiError::Forbidden("wallet is archived".into()));

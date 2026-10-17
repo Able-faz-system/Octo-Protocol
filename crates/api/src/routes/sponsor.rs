@@ -1,6 +1,6 @@
 //! Sponsored transaction endpoints: sponsor a fee-bump, and list history.
 
-use crate::auth::authorize_wallet;
+use crate::auth::authorize_wallet_scope;
 use crate::error::{ApiError, ApiResult, Envelope};
 use crate::json::parse_optional;
 use crate::sponsor_validation::validate_inner_xdr;
@@ -42,7 +42,7 @@ pub async fn sponsor(
     body: Bytes,
 ) -> ApiResult<(StatusCode, Json<Envelope<SponsorResponse>>)> {
     // Login JWT or API key, scoped to this wallet.
-    authorize_wallet(&headers, &state, wallet_id).await?;
+    authorize_wallet_scope(&headers, &state, wallet_id, "sponsor").await?;
 
     let req: SponsorRequest = parse_optional(&body)?;
     let inner_xdr = req

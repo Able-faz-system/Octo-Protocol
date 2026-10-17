@@ -5,7 +5,7 @@
 //! user's own ed25519 signature (checked by the network); the API credential only authorizes use
 //! of Octo's relay + bookkeeping.
 
-use crate::auth::{authorize_wallet, require_login};
+use crate::auth::{authorize_wallet, authorize_wallet_scope, require_login};
 use crate::error::{ApiError, ApiResult, Envelope};
 use crate::json::parse_optional;
 use crate::state::AppState;
@@ -183,7 +183,7 @@ pub async fn submit_signed(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<(StatusCode, Json<Envelope<SubmitSignedResponse>>)> {
-    authorize_wallet(&headers, &state, wallet_id).await?;
+    authorize_wallet_scope(&headers, &state, wallet_id, "write").await?;
     // For the audit log only: present when the caller used a login JWT (None for API keys).
     let audit_user = crate::auth::authenticate(&headers, &state).await.ok();
     let wallet = state.store().get_wallet(wallet_id).await?;

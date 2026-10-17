@@ -1,6 +1,6 @@
 //! Payment links: shareable public URLs that accept a USDC deposit.
 
-use crate::auth::authorize_wallet;
+use crate::auth::{authorize_wallet, authorize_wallet_scope};
 use crate::error::{ApiError, ApiResult, Envelope};
 use crate::json::parse_optional;
 use crate::state::AppState;
@@ -54,7 +54,7 @@ pub async fn create_payment_link(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<(StatusCode, Json<Envelope<PaymentLinkView>>)> {
-    authorize_wallet(&headers, &state, wallet_id).await?;
+    authorize_wallet_scope(&headers, &state, wallet_id, "write").await?;
     let req: CreatePaymentLinkRequest = parse_optional(&body)?;
     let name = req
         .name
@@ -278,7 +278,7 @@ pub async fn set_payment_link_active(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Json<Envelope<PaymentLinkView>>> {
-    authorize_wallet(&headers, &state, wallet_id).await?;
+    authorize_wallet_scope(&headers, &state, wallet_id, "write").await?;
     let req: SetPaymentLinkActiveRequest = parse_optional(&body)?;
     let active = req
         .active

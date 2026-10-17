@@ -298,20 +298,47 @@ impl Store {
         wallet_id: Uuid,
         prefix: &str,
         key_hash: &str,
+        scopes: &[String],
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<ApiKey, StoreError> {
         sqlx::query_as::<_, ApiKey>(
             r#"
-            INSERT INTO api_keys (wallet_id, prefix, key_hash)
-            VALUES ($1, $2, $3)
+            INSERT INTO api_keys (wallet_id, prefix, key_hash, scopes, expires_at)
+            VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (wallet_id)
             DO UPDATE SET prefix = EXCLUDED.prefix, key_hash = EXCLUDED.key_hash,
-                          created_at = now()
+                          scopes = EXCLUDED.scopes, expires_at = EXCLUDED.expires_at,
+                          last_used_at = NULL, created_at = now()
             RETURNING *
             "#,
         )
         .bind(wallet_id)
         .bind(prefix)
         .bind(key_hash)
+        .bind(scopes)
+        .bind(expires_at)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(StoreError::Database)
+    }
+
+    pub async fn create_api_key(
+        &self,
+        wallet_id: Uuid,
+        prefix: &str,
+        key_hash: &str,
+        scopes: &[String],
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<ApiKey, StoreError> {
+        sqlx::query_as::<_, ApiKey>(
+            "INSERT INTO api_keys (wallet_id, prefix, key_hash, scopes, expires_at) \
+             VALUES ($1, $2, $3, $4, $5) RETURNING *",
+        )
+        .bind(wallet_id)
+        .bind(prefix)
+        .bind(key_hash)
+        .bind(scopes)
+        .bind(expires_at)
         .fetch_one(&self.pool)
         .await
         .map_err(StoreError::Database)
@@ -326,14 +353,16 @@ impl Store {
         Ok(row)
     }
 
-    /// Look up the wallet that owns a key by its hash (for API-key authentication later).
-    pub async fn wallet_id_for_key_hash(&self, key_hash: &str) -> Result<Option<Uuid>, StoreError> {
-        let row: Option<(Uuid,)> =
-            sqlx::query_as("SELECT wallet_id FROM api_keys WHERE key_hash = $1")
-                .bind(key_hash)
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(row.map(|r| r.0))
+    /// Validate an unexpired API key and atomically record its latest use.
+    pub async fn use_api_key(&self, key_hash: &str) -> Result<Option<ApiKey>, StoreError> {
+        let row = sqlx::query_as::<_, ApiKey>(
+            "UPDATE api_keys SET last_used_at = now() WHERE key_hash = $1 \
+             AND (expires_at IS NULL OR expires_at > now()) RETURNING *",
+        )
+        .bind(key_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
     }
 
     /// Delete (revoke) the API key for a wallet. Returns `Ok(())` even if no key existed.
