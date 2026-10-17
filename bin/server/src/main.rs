@@ -5,6 +5,8 @@
 // Can be split for scale — ingest cursor makes the worker restart-safe and rerunnable.
 #![forbid(unsafe_code)]
 
+mod mainnet_guard;
+
 use anyhow::{Context, Result};
 use octo_api::{build_router, AppState};
 use octo_email::EmailSender;
@@ -24,6 +26,11 @@ async fn main() -> Result<()> {
     init_tracing();
 
     let cfg = Config::from_env()?;
+    // Fail closed before touching the DB; exit directly so the operator sees exactly one fatal line.
+    if let Err(e) = cfg.ensure_safe_for_network() {
+        tracing::error!(network = cfg.network.as_str(), "{e}");
+        std::process::exit(1);
+    }
     tracing::info!(network = cfg.network.as_str(), bind = %cfg.bind_addr, "starting octo-server");
 
     // Database.
@@ -255,6 +262,22 @@ struct Config {
 }
 
 impl Config {
+    /// Reject placeholder/low-entropy secrets and plaintext URLs when running on mainnet.
+    fn ensure_safe_for_network(&self) -> Result<(), mainnet_guard::UnsafeMainnetConfig> {
+        mainnet_guard::check(
+            self.network,
+            &mainnet_guard::MainnetCheck {
+                jwt_secret: &self.jwt_secret,
+                master_key: &self.master_key,
+                master_key_next: self.master_key_next.as_ref(),
+                resend_api_key: &self.resend_api_key,
+                horizon_url: &self.horizon_url,
+                public_app_url: &self.public_app_url,
+                public_api_url: self.public_api_url.as_deref(),
+            },
+        )
+    }
+
     fn from_env() -> Result<Config> {
         let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL is required")?;
 

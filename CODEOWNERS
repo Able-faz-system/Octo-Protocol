@@ -5,3 +5,18 @@
 /crates/wallet-core/ @blockme/security
 /crates/crypto/      @blockme/security
 /SECURITY.md         @blockme/security
+
+# Dependency manifests: every Dependabot cargo PR (crypto-crate bumps included) lands here.
+# Later rules override `*`, so maintainers are listed explicitly alongside security.
+/Cargo.toml                   @blockme/maintainers @blockme/security
+/Cargo.lock                   @blockme/maintainers @blockme/security
+/crates/crypto/Cargo.toml     @blockme/maintainers @blockme/security
+/crates/wallet-core/Cargo.toml @blockme/maintainers @blockme/security
+
+# Supply-chain controls: workflows, Dependabot policy, and scanner exception lists.
+/.github/           @blockme/maintainers @blockme/security
+/deny.toml          @blockme/maintainers @blockme/security
+/.cargo/audit.toml  @blockme/maintainers @blockme/security
+/.gitleaksignore    @blockme/maintainers @blockme/security
+/scripts/check-pinned-actions.sh @blockme/maintainers @blockme/security
+/CODEOWNERS         @blockme/maintainers @blockme/security

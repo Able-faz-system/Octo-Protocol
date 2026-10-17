@@ -1,0 +1,64 @@
+name: SBOM
+
+# CycloneDX inventory of everything that ships, including transitive dependencies. Runs on trusted
+# refs only: cargo-cyclonedx evaluates build metadata and must not run on untrusted fork code.
+on:
+  push:
+    branches: [main]
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    name: Generate CycloneDX SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: 1.84.1
+
+      # Prebuilt, checksum-verified binary: `cargo install` would hit the 1.84.1 toolchain pin.
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-cyclonedx@0.5.9
+
+      - name: Generate SBOMs
+        # --all lists the full transitive tree (not only direct deps); --target all covers every platform.
+        run: |
+          cargo cyclonedx --all --all-features --target all --format json --spec-version 1.5
+          mkdir -p sbom
+          find . -name '*.cdx.json' -not -path './target/*' -not -path './sbom/*' -exec mv {} sbom/ \;
+          ls -l sbom
+          test -n "$(ls -A sbom)"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sbom-cyclonedx
+          path: sbom/*.cdx.json
+          if-no-files-found: error
+
+  attach:
+    name: Attach SBOM to release
+    if: github.event_name == 'release'
+    needs: generate
+    runs-on: ubuntu-latest
+    # Only this job can write, and it never checks out or runs repository code.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: sbom-cyclonedx
+          path: sbom
+      - name: Upload release assets
+        run: gh release upload "$TAG" sbom/*.cdx.json --clobber --repo "$GITHUB_REPOSITORY"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
