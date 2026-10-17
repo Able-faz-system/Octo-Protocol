@@ -12,9 +12,11 @@
 //! - [`Store::create_withdrawal`] is idempotent on `(wallet_id, idempotency_key)`.
 #![forbid(unsafe_code)]
 
+mod config;
 mod error;
 mod models;
 
+pub use config::{StoreConfig, StoreConfigError};
 pub use error::StoreError;
 pub use models::{
     Address, ApiKey, AuditLog, DenylistedToken, EmailOtp, GasSponsorshipConfig, NewDeposit,
@@ -74,10 +76,29 @@ pub struct NewWithdrawal<'a> {
 }
 
 impl Store {
-    /// Connect to Postgres at `database_url` and return a pooled handle.
+    /// Connect to Postgres at `database_url` with [`StoreConfig::default`].
     pub async fn connect(database_url: &str) -> Result<Self, StoreError> {
+        Self::connect_with(database_url, &StoreConfig::default()).await
+    }
+
+    /// Connect with explicit pool sizing and timeouts (see [`StoreConfig::from_env`]).
+    pub async fn connect_with(database_url: &str, cfg: &StoreConfig) -> Result<Self, StoreError> {
+        let statement_timeout_ms = cfg.statement_timeout.as_millis().to_string();
         let pool = PgPoolOptions::new()
-            .max_connections(10)
+            .max_connections(cfg.max_connections)
+            .acquire_timeout(cfg.acquire_timeout)
+            .idle_timeout(cfg.idle_timeout)
+            // Session-level, so it applies to every statement on every pooled connection.
+            .after_connect(move |conn, _meta| {
+                let ms = statement_timeout_ms.clone();
+                Box::pin(async move {
+                    sqlx::query("SELECT set_config('statement_timeout', $1, false)")
+                        .bind(ms)
+                        .execute(conn)
+                        .await?;
+                    Ok(())
+                })
+            })
             .connect(database_url)
             .await?;
         Ok(Self { pool })
@@ -89,8 +110,17 @@ impl Store {
     }
 
     /// Apply all pending migrations.
+    ///
+    /// Runs on a connection detached from the pool with `statement_timeout` disabled, so a slow
+    /// index build is not killed by the request-path timeout and the override never leaks back.
     pub async fn migrate(&self) -> Result<(), StoreError> {
-        MIGRATOR.run(&self.pool).await?;
+        let mut conn = self.pool.acquire().await?.detach();
+        sqlx::query("SET statement_timeout = 0")
+            .execute(&mut conn)
+            .await?;
+        let result = MIGRATOR.run(&mut conn).await;
+        let _ = sqlx::Connection::close(conn).await;
+        result?;
         Ok(())
     }
 
@@ -508,6 +538,8 @@ impl Store {
     ///   `dormant_interval_secs`
     ///
     /// A wallet with no cursor row has never been polled, so it is always due.
+    ///
+    /// Unbounded; prefer [`Store::wallets_due_for_poll_page`] when the wallet count can be large.
     pub async fn wallets_due_for_poll(
         &self,
         network: &str,
@@ -516,11 +548,40 @@ impl Store {
         dormant_after_secs: i64,
         dormant_interval_secs: i64,
     ) -> Result<Vec<Wallet>, StoreError> {
+        // `LIMIT NULL` is "no limit" in Postgres, so this is the paged query's full result.
+        self.wallets_due_for_poll_page(
+            network,
+            active_after_secs,
+            idle_interval_secs,
+            dormant_after_secs,
+            dormant_interval_secs,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// One keyset page of [`Store::wallets_due_for_poll`], ordered by `id`, with the exact same
+    /// backoff filter. Pass the last row's id as `after_id` for the next page; `limit = None`
+    /// returns everything. Paging on the unique primary key means no wallet is skipped or
+    /// returned twice across page boundaries within one pass.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn wallets_due_for_poll_page(
+        &self,
+        network: &str,
+        active_after_secs: i64,
+        idle_interval_secs: i64,
+        dormant_after_secs: i64,
+        dormant_interval_secs: i64,
+        limit: Option<i64>,
+        after_id: Option<Uuid>,
+    ) -> Result<Vec<Wallet>, StoreError> {
         let rows = sqlx::query_as::<_, Wallet>(
             r#"
             SELECT w.* FROM wallets w
             LEFT JOIN ingest_cursor c ON c.wallet_id = w.id
             WHERE w.network = $1
+              AND ($6::uuid IS NULL OR w.id > $6)
               -- Never polled, or never saw activity => always due.
               AND (
                 c.last_polled_at IS NULL
@@ -535,7 +596,8 @@ impl Store {
                        ELSE $3
                      END)
               )
-            ORDER BY w.created_at
+            ORDER BY w.id
+            LIMIT $7
             "#,
         )
         .bind(network)
@@ -543,6 +605,8 @@ impl Store {
         .bind(idle_interval_secs as f64)
         .bind(dormant_after_secs as f64)
         .bind(dormant_interval_secs as f64)
+        .bind(after_id)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
@@ -1774,6 +1838,29 @@ impl Store {
         Ok(found.is_some())
     }
 
+    // --- ingest leader lock ------------------------------------------------
+
+    /// Try once to become the ingest leader for `network`; `None` means another instance holds it.
+    ///
+    /// Uses a session-level `pg_try_advisory_lock`, so the lock is tied to one connection. On
+    /// success that connection is detached from the pool (see [`IngestLeaderLock`]); on failure
+    /// it goes straight back, holding nothing.
+    pub async fn try_acquire_ingest_leader(
+        &self,
+        network: &str,
+    ) -> Result<Option<IngestLeaderLock>, StoreError> {
+        let mut conn = self.pool.acquire().await?;
+        let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1, hashtext($2))")
+            .bind(INGEST_LOCK_CLASS)
+            .bind(network)
+            .fetch_one(&mut *conn)
+            .await?;
+        Ok(acquired.then(|| IngestLeaderLock {
+            conn: conn.detach(),
+            network: network.to_string(),
+        }))
+    }
+
     // --- ingest cursor ----------------------------------------------------
 
     /// Read the saved Horizon paging token for a wallet, if any.
@@ -1999,5 +2086,85 @@ impl Store {
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected())
+    }
+
+    // --- rate limiting ------------------------------------------------------
+
+    /// Count one hit against the fixed window for `(key, class)` and return the hits so far.
+    ///
+    /// A single `INSERT .. ON CONFLICT DO UPDATE` is atomic under concurrency (the conflicting
+    /// row is locked), so replicas sharing this database share one counter. An expired window is
+    /// restarted in place. Uses the database clock, so replica clock skew cannot stretch windows.
+    pub async fn rate_limit_hit(
+        &self,
+        key: &str,
+        class: &str,
+        window: std::time::Duration,
+    ) -> Result<i64, StoreError> {
+        let hits: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO rate_limit_buckets (key, class, hits, expires_at)
+            VALUES ($1, $2, 1, now() + make_interval(secs => $3))
+            ON CONFLICT (key, class) DO UPDATE SET
+                hits = CASE WHEN rate_limit_buckets.expires_at <= now() THEN 1
+                            ELSE rate_limit_buckets.hits + 1 END,
+                expires_at = CASE WHEN rate_limit_buckets.expires_at <= now()
+                                  THEN EXCLUDED.expires_at
+                                  ELSE rate_limit_buckets.expires_at END
+            RETURNING hits
+            "#,
+        )
+        .bind(key)
+        .bind(class)
+        .bind(window.as_secs_f64())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(hits)
+    }
+
+    /// Delete expired rate-limit windows. Returns the number of rows removed.
+    pub async fn prune_rate_limit_buckets(&self) -> Result<u64, StoreError> {
+        let result = sqlx::query("DELETE FROM rate_limit_buckets WHERE expires_at < now()")
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+/// Advisory-lock class id for ingest leadership (ASCII "OCTI"); the network is the second key.
+const INGEST_LOCK_CLASS: i32 = 0x4F43_5449;
+
+/// A held session-level advisory lock electing this process as ingest leader for one network.
+///
+/// The lock lives on a dedicated connection detached from the pool: left in the pool, unrelated
+/// queries would share it and it could never be released deliberately. Postgres frees the lock
+/// when this connection ends, so a crashed or partitioned leader releases it with no cleanup.
+pub struct IngestLeaderLock {
+    conn: sqlx::PgConnection,
+    network: String,
+}
+
+impl IngestLeaderLock {
+    /// Whether this session still holds the lock (false if the connection died or it was freed).
+    pub async fn still_held(&mut self) -> bool {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND granted
+               AND pid = pg_backend_pid() AND classid = $1::oid AND objid = hashtext($2)::oid)",
+        )
+        .bind(INGEST_LOCK_CLASS)
+        .bind(&self.network)
+        .fetch_one(&mut self.conn)
+        .await
+        .unwrap_or(false)
+    }
+
+    /// Unlock and close the connection so a standby can take over on its next retry.
+    pub async fn release(mut self) {
+        let _ = sqlx::query("SELECT pg_advisory_unlock($1, hashtext($2))")
+            .bind(INGEST_LOCK_CLASS)
+            .bind(&self.network)
+            .execute(&mut self.conn)
+            .await;
+        let _ = sqlx::Connection::close(self.conn).await;
     }
 }

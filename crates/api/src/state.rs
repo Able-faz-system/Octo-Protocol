@@ -42,7 +42,7 @@ struct Inner {
     webhooks: WebhookSender,
     /// Sends OTP/welcome/withdrawal emails via Resend.
     email: EmailSender,
-    /// Per-IP rate limiting for auth + public endpoints.
+    /// Rate limiting for auth + public endpoints (in-memory or shared via Postgres).
     rate_limiter: crate::rate_limit::RateLimiter,
     /// Cloudinary credentials for signed image uploads; `None` when unconfigured, in which case
     /// the upload endpoint reports that the feature is off rather than failing obscurely.
@@ -138,6 +138,12 @@ impl AppState {
         // Arc is unique here in practice (called right after `new`), so rebuild the inner.
         let inner = Arc::make_mut(&mut self.inner);
         inner.jwt_secret = secret;
+        self
+    }
+
+    /// Swap the rate-limit backend (defaults to per-process memory; use Postgres with replicas).
+    pub fn with_rate_limiter(mut self, limiter: crate::rate_limit::RateLimiter) -> Self {
+        Arc::make_mut(&mut self.inner).rate_limiter = limiter;
         self
     }
 
@@ -256,7 +262,6 @@ impl AppState {
             .as_deref()
             .into_iter()
             .chain(std::iter::once(&*self.inner.master_key))
-    }
     }
 
     pub fn jwt_secret(&self) -> &[u8] {
