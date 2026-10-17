@@ -3,6 +3,9 @@
 // Loads config from env, connects & migrates the DB, then runs both the REST API (axum)
 // and the deposit ingest supervisor (polls Horizon for all wallets) in one process.
 // Can be split for scale — ingest cursor makes the worker restart-safe and rerunnable.
+//
+// `octo-server verify-audit-chain [--user <uuid>]` instead verifies the audit hash chain and
+// exits non-zero if any chain is broken (needs only DATABASE_URL and AUDIT_CHAIN_KEY).
 #![forbid(unsafe_code)]
 
 use anyhow::{Context, Result};
@@ -10,20 +13,38 @@ use octo_api::{build_router, AppState};
 use octo_email::EmailSender;
 use octo_ingest::Supervisor;
 use octo_resilience::ResilienceConfig;
-use octo_store::Store;
+use octo_store::{AuditChainKey, AuditChainStatus, Store};
 use octo_wallet_core::StellarNetwork;
 use octo_webhooks::WebhookSender;
 use std::future::IntoFuture;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+use zeroize::Zeroizing;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     // Load .env if present (no-op in production where env is set directly).
     let _ = dotenvy::dotenv();
     init_tracing();
 
+    // Config (and so every secret) is read and scrubbed from the environment *before* the runtime
+    // starts any threads: removing env vars is only sound while nothing else can be reading them.
+    if std::env::args().nth(1).as_deref() == Some("verify-audit-chain") {
+        let cfg = VerifyConfig::from_env()?;
+        return runtime()?.block_on(verify_audit_chain(cfg));
+    }
     let cfg = Config::from_env()?;
+    runtime()?.block_on(serve(cfg))
+}
+
+fn runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime")
+}
+
+async fn serve(cfg: Config) -> Result<()> {
     tracing::info!(network = cfg.network.as_str(), bind = %cfg.bind_addr, "starting octo-server");
 
     // Database.
@@ -58,6 +79,7 @@ async fn main() -> Result<()> {
         resilience.circuit_breaker(),
     )
     .with_jwt_secret(cfg.jwt_secret.clone())
+    .with_audit_chain_key(cfg.audit_chain_key.clone())
     .with_public_api_url(cfg.public_api_url.as_deref())
     .map_err(anyhow::Error::msg)?;
     // MASTER_KEY_NEXT, when set, activates zero-downtime key rotation: already-migrated rows
@@ -110,6 +132,21 @@ async fn main() -> Result<()> {
                 Err(e) => {
                     tracing::warn!(error = ?e, "failed to reconcile stale pending sponsorships");
                 }
+            }
+        }
+    });
+
+    // Hourly prune of expired deny-list entries and sessions, so neither table grows unbounded.
+    let purge_store = store.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
+        loop {
+            interval.tick().await;
+            if let Err(e) = purge_store.purge_expired_tokens().await {
+                tracing::warn!(error = ?e, "failed to purge expired deny-list tokens");
+            }
+            if let Err(e) = purge_store.purge_expired_sessions().await {
+                tracing::warn!(error = ?e, "failed to purge expired sessions");
             }
         }
     });
@@ -208,6 +245,88 @@ async fn shutdown_signal() -> &'static str {
     }
 }
 
+/// `verify-audit-chain`: check every user's chain (or one, with `--user <uuid>`).
+async fn verify_audit_chain(cfg: VerifyConfig) -> Result<()> {
+    let store = Store::connect(&cfg.database_url)
+        .await
+        .context("connect to database")?;
+    let reports = match cfg.user {
+        Some(user_id) => vec![store.verify_audit_chain(&cfg.audit_chain_key, user_id).await?],
+        None => store.verify_all_audit_chains(&cfg.audit_chain_key).await?,
+    };
+    let mut broken = 0usize;
+    for r in &reports {
+        if let AuditChainStatus::Broken { seq, reason } = &r.status {
+            broken += 1;
+            tracing::error!(user_id = %r.user_id, seq = ?seq, reason, "audit chain broken");
+        }
+    }
+    let rows: u64 = reports.iter().map(|r| r.rows_verified).sum();
+    let unchained = reports
+        .iter()
+        .filter(|r| r.status == AuditChainStatus::Unchained)
+        .count();
+    tracing::info!(
+        users = reports.len(),
+        rows_verified = rows,
+        unchained_users = unchained,
+        broken,
+        "audit chain verification finished"
+    );
+    if broken > 0 {
+        anyhow::bail!("{broken} of {} audit chains failed verification", reports.len());
+    }
+    Ok(())
+}
+
+/// Read a base64 32-byte key from `name` into zeroizing memory and remove it from the process
+/// environment. `None` when unset.
+///
+/// Limitation: this scrubs only our copies. The kernel's `/proc/<pid>/environ` snapshot and
+/// libc's original environment strings are not ours to wipe — see docs/threat-model.md.
+fn take_key_from_env(name: &str) -> Result<Option<Zeroizing<[u8; 32]>>> {
+    let raw = match std::env::var(name) {
+        Ok(v) => Zeroizing::new(v),
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!("{name} must be valid UTF-8"),
+    };
+    std::env::remove_var(name);
+    AppState::decode_master_key(&raw)
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("{name} must be base64-encoded 32 bytes"))
+}
+
+/// `AUDIT_CHAIN_KEY`, required: an audit chain without a secret key proves nothing.
+fn audit_chain_key_from_env() -> Result<AuditChainKey> {
+    take_key_from_env("AUDIT_CHAIN_KEY")?
+        .map(AuditChainKey::new)
+        .context("AUDIT_CHAIN_KEY is required (base64 32 bytes; signs the audit hash chain)")
+}
+
+/// Configuration for `verify-audit-chain`.
+struct VerifyConfig {
+    database_url: String,
+    audit_chain_key: AuditChainKey,
+    user: Option<Uuid>,
+}
+
+impl VerifyConfig {
+    fn from_env() -> Result<VerifyConfig> {
+        let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL is required")?;
+        let audit_chain_key = audit_chain_key_from_env()?;
+        let user = std::env::args()
+            .skip_while(|a| a != "--user")
+            .nth(1)
+            .map(|v| v.parse::<Uuid>().context("--user must be a UUID"))
+            .transpose()?;
+        Ok(VerifyConfig {
+            database_url,
+            audit_chain_key,
+            user,
+        })
+    }
+}
+
 fn init_tracing() {
     let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info,octo=debug".to_string());
     tracing_subscriber::fmt()
@@ -228,13 +347,15 @@ struct Config {
     public_api_url: Option<String>,
     resend_api_key: String,
     email_from_address: String,
-    master_key: [u8; 32],
+    master_key: Zeroizing<[u8; 32]>,
     /// Optional next master key for zero-downtime rotation. Present only during the rotation
     /// window while `octo-migrate-keys` is backfilling. When set, the server uses this key as
     /// the primary signing key (for already-migrated rows) and falls back to `master_key` for
     /// rows not yet re-sealed. See `docs/key-rotation.md` for the full runbook.
-    master_key_next: Option<[u8; 32]>,
+    master_key_next: Option<Zeroizing<[u8; 32]>>,
     jwt_secret: Vec<u8>,
+    /// HMAC key for the tamper-evident audit chain. Must stay stable across deploys.
+    audit_chain_key: AuditChainKey,
     bind_addr: String,
     ingest_interval_secs: u64,
     ingest_page_limit: u32,
@@ -280,19 +401,11 @@ impl Config {
         let email_from_address =
             std::env::var("EMAIL_FROM_ADDRESS").context("EMAIL_FROM_ADDRESS is required")?;
 
-        let master_key_b64 = std::env::var("MASTER_KEY").context("MASTER_KEY is required")?;
-        let master_key = AppState::decode_master_key(&master_key_b64)
-            .map_err(|_| anyhow::anyhow!("MASTER_KEY must be base64-encoded 32 bytes"))?;
-
+        let master_key = take_key_from_env("MASTER_KEY")?.context("MASTER_KEY is required")?;
         // During key rotation, MASTER_KEY_NEXT lets the server sign with the new key (if present)
         // and fall back to the old key for unmigrated rows. Both must remain secure at all times.
-        let master_key_next = std::env::var("MASTER_KEY_NEXT")
-            .ok()
-            .map(|b64| {
-                AppState::decode_master_key(&b64)
-                    .map_err(|_| anyhow::anyhow!("MASTER_KEY_NEXT must be base64-encoded 32 bytes"))
-            })
-            .transpose()?;
+        let master_key_next = take_key_from_env("MASTER_KEY_NEXT")?;
+        let audit_chain_key = audit_chain_key_from_env()?;
 
         let jwt_secret = std::env::var("JWT_SECRET")
             .context("JWT_SECRET is required (used to sign dashboard auth tokens)")?
@@ -333,6 +446,7 @@ impl Config {
             master_key,
             master_key_next,
             jwt_secret,
+            audit_chain_key,
             bind_addr,
             ingest_interval_secs,
             ingest_page_limit,

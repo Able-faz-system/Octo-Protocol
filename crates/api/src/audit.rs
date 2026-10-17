@@ -1,7 +1,8 @@
 //! Audit logging helpers.
 //!
 //! Records notable account activity (sign-in, wallet/address/key creation, withdrawals). Auditing
-//! is best-effort: a failure here is logged but never blocks the primary operation.
+//! is best-effort: a failure here is logged but never blocks the primary operation. Rows are
+//! hash-chained per user for tamper evidence (see `octo_store::AuditChainKey`).
 
 use crate::state::AppState;
 use axum::http::HeaderMap;
@@ -47,7 +48,14 @@ pub async fn record(
     let ip = client_ip(headers);
     if let Err(e) = state
         .store()
-        .record_audit(user_id, action, category, target, ip.as_deref())
+        .record_audit(
+            state.audit_chain_key(),
+            user_id,
+            action,
+            category,
+            target,
+            ip.as_deref(),
+        )
         .await
     {
         tracing::warn!(error = ?e, action, "failed to record audit log");

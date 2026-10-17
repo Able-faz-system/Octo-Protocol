@@ -44,6 +44,7 @@ responsible for the largest share of real-world crypto theft.
 | User key backup stolen from DB dump / backup | `encrypted_backup` is ciphertext the **client** produced under the user's password (PBKDF2→AES-256-GCM in the browser). octo stores it opaquely and holds no password or key to open it | cutover |
 | Gas-tank seed stolen from DB dump / backup | Seed stored **AES-256-GCM encrypted**, random nonce+salt; master key from KMS/secret-manager, never in the DB or repo. **Loss is bounded by the gas budget — no customer funds** | 3, 5 |
 | Seed/keys leaked via logs, crash dumps, swap | Secrets live only in `wallet-core`; `Zeroizing` wrappers wipe seed & derived keys on drop; `Debug` never prints secret bytes; `unwrap`/`panic` denied by clippy there | 3, 4 |
+| Master key lingering in memory / core dumps | `MASTER_KEY`, `MASTER_KEY_NEXT` and `AUDIT_CHAIN_KEY` are read into `Zeroizing` buffers, decoded into a fixed zeroizing buffer (no reallocating `Vec`), held as `Zeroizing<[u8; 32]>` and removed from the process environment before the runtime starts any threads. **Limitation:** see "Env-based secrets" below | #434 |
 | Master key compromise | KMS-held key; zero-downtime rotation via `sealed_scheme` + `bin/migrate-keys`; defense-in-depth so DB-only compromise is insufficient. Only gas tanks are affected | 3, rotation |
 | Weak randomness in key/nonce generation | Use `OsRng` (CSPRNG) only; never `rand::thread_rng` seeded predictably for key material; test that two seals of same plaintext differ | 3, 4 |
 | Derived key reused across contexts | One derivation path per account; keys are ephemeral and zeroized | 4 |
@@ -87,6 +88,9 @@ responsible for the largest share of real-world crypto theft.
 | SQL injection | `sqlx` parameterized queries only; no string-built SQL | 5 |
 | AuthN/AuthZ bypass | Dashboard JWT **or** per-wallet API key, with per-route authorization. Sensitive actions (gas-tank provisioning, key-backup read, API-key management) require a JWT and reject API keys | 6 |
 | Stolen session token stays valid | Tokens carry a unique `jti`; `logout` **and** `refresh` deny-list the presented token, and every authenticated request checks the deny-list. (Refresh previously re-issued without revoking, and could even return a byte-identical token) | 6 |
+| Compromised device keeps a live session | Every token names a `sessions` row (`sid`). Users list sessions and revoke any one, or all others (which also bumps `session_epoch`, killing pre-session tokens); the per-request check rejects a revoked session immediately. Queries are scoped by user id, so another user's session id is a `404` | #435 |
+| OTP brute force via parallel guesses | Each attempt is claimed atomically (`attempts < 5` in the same `UPDATE` that increments it) before the code is compared, and consumption is conditional, so concurrent guesses can't exceed the cap and one code can't be redeemed twice. (Previously read-then-increment let a burst of parallel guesses all see `attempts = 0`) | #435 |
+| Credentials leaking into logs | `tests/log_secret_tests.rs` captures all tracing output at TRACE through the auth, API-key, gas-tank, withdrawal-OTP and password-reset flows and fails on any token, API key, OTP code, password or BIP39 phrase | #436 |
 | SSRF via webhook/Horizon URLs | `is_safe_url` blocks loopback, private, link-local and carrier-grade-NAT targets — IPv4 **and bracketed IPv6** (a naive `:`-split previously let `[fe80::1]` through) | 9 |
 | Webhook forgery / tampering | Outbound webhooks **HMAC-SHA256 signed**; consumers verify. Inbound (if any) verified | 9 |
 | Replay of API requests | TLS; mutating on-chain actions are pinned by the signed transaction's sequence number, so a replay is rejected on-chain | 10 |
@@ -101,6 +105,7 @@ responsible for the largest share of real-world crypto theft.
 | Unsafe Rust memory bugs | `#![forbid(unsafe_code)]` in every crate (already set) | 2 ✓ |
 | Panics that crash or leak | `clippy::unwrap_used`/`expect_used` denied in `wallet-core`; errors propagated | 3, 4 |
 | No audit trail | Append-only transaction + webhook-delivery logs | 5, 9 |
+| Audit log edited by someone with DB access | Per-user HMAC hash chain (`AUDIT_CHAIN_KEY`, never stored in the DB) plus a MAC'd chain head: any edit, deletion or truncation fails `octo-server verify-audit-chain`. Appends are serialized per user by an advisory lock; a `UNIQUE (user_id, seq)` index backstops it. See `docs/audit-log.md` for limits | #437 |
 | Disaster recovery (user wallet) | **The user's responsibility, by design.** Recovery is via their BIP39 mnemonic, or the password-encrypted backup blob octo stores but cannot read. octo has no ability to recover a wallet whose owner has lost both | cutover |
 | Disaster recovery (gas tank) | Gas-tank seeds are server-held and covered by DB backup + master-key rotation (`bin/migrate-keys`) | rotation |
 | Schema migrations silently not applied | sqlx keys migrations by version number, so two files sharing a version means only one ever runs. A test pins the exact applied version set — this had already happened five times before it was caught | 5 |
@@ -130,6 +135,13 @@ responsible for the largest share of real-world crypto theft.
   dependency hygiene, and eventually hardware-wallet signing.
 - **Unrecoverable by design.** If a user loses both password and recovery phrase, the funds are
   gone; octo cannot help. This must be said plainly in product UI, not buried.
+- **Env-based secrets can't be fully scrubbed.** The server wipes its own copies of
+  `MASTER_KEY`/`MASTER_KEY_NEXT`/`AUDIT_CHAIN_KEY` and removes them from its environment, but
+  the original strings stay in memory it doesn't own: the kernel's copy (`/proc/<pid>/environ`,
+  readable by the same user or root), libc's initial environment block, and whatever the
+  orchestrator or `.env` file holds. Treat the env as a delivery channel, not a vault: prefer a
+  secret manager or KMS, and disable core dumps for the process (`ulimit -c 0` /
+  `RLIMIT_CORE=0` in the container; this crate forbids the `unsafe` a `prctl` call would need).
 - **Gas tank remains a hot key** (online, encrypted + zeroized + op-allowlisted). Exposure is
   bounded by the gas budget; MPC/HSM for this key is a later phase.
 

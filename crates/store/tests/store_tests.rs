@@ -959,9 +959,11 @@ async fn list_sponsored_transactions_orders_filters_and_paginates_correctly() {
 async fn list_audit_logs_filters_by_category_and_search_correctly() {
     let Some(store) = store().await else { return };
     let user_id = fresh_user(&store).await;
+    let key = octo_store::AuditChainKey::new(zeroize::Zeroizing::new([7u8; 32]));
 
     store
         .record_audit(
+            &key,
             user_id,
             "signed in",
             "authentication",
@@ -972,6 +974,7 @@ async fn list_audit_logs_filters_by_category_and_search_correctly() {
         .expect("record 1");
     store
         .record_audit(
+            &key,
             user_id,
             "created wallet octo master wallet",
             "wallet",
@@ -981,7 +984,7 @@ async fn list_audit_logs_filters_by_category_and_search_correctly() {
         .await
         .expect("record 2");
     store
-        .record_audit(user_id, "rotated api key", "credentials", None, None)
+        .record_audit(&key, user_id, "rotated api key", "credentials", None, None)
         .await
         .expect("record 3");
 
