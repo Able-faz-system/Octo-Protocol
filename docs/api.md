@@ -50,7 +50,9 @@ decrypt. Consequently:
 - `GET  /v1/wallets/{id}/balances` — live on-chain balances.
 - `GET  /v1/wallets/{id}/transactions` — deposits + outbound transfers (paginated).
 - `GET  /v1/wallets/{id}/backup` — the opaque client-encrypted backup blob, for new-device
-  recovery. **Dashboard JWT only.** Useless without the user's password.
+  recovery. **Dashboard JWT only.** Useless without the user's password. Rate-limited to 5
+  requests per hour per user (`429` beyond that); every successful read writes an audit row, and
+  the request fails with `500` rather than return the blob if that row can't be written.
 
 ## Moving funds (the non-custodial path)
 

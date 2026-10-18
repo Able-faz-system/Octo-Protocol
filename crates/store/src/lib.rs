@@ -650,6 +650,19 @@ impl Store {
             .ok_or(StoreError::NotFound)
     }
 
+    /// The newest wallet on `network` that carries a server-sealed seed, if any.
+    ///
+    /// Used by the startup self-test to prove the configured master key opens real data.
+    pub async fn latest_sealed_wallet(&self, network: &str) -> Result<Option<Wallet>, StoreError> {
+        Ok(sqlx::query_as::<_, Wallet>(
+            "SELECT * FROM wallets WHERE network = $1 AND sealed_ciphertext IS NOT NULL
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(network)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
     /// Atomically swap the sealed seed material for a single wallet after a reseal/key-rotation.
     ///
     /// The caller (typically `bin/migrate-keys`) opens the old seed with the old master key,

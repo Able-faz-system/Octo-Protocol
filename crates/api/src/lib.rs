@@ -11,6 +11,7 @@ pub mod horizon;
 mod json;
 pub mod rate_limit;
 pub mod routes;
+pub mod self_test;
 pub mod sponsor_validation;
 mod state;
 pub mod submit_validation;

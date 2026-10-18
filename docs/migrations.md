@@ -19,7 +19,7 @@ This document serves as the single changelog-style decision index tracking every
 | `wallets` | `ingest_cursor` | `wallet_id` | `CASCADE` | Horizon sync cursor has a 1:1 lifecycle with the wallet. |
 | `users` | `wallets` | `user_id` | `SET NULL` | Preserves non-custodial wallets if an admin or dashboard user account is deleted. |
 | `wallets` | `api_keys` | `wallet_id` | `CASCADE` | API keys derive their permissions solely from the parent wallet. |
-| `users` | `audit_logs` | `user_id` | `CASCADE` | User-scoped audit events; system-level logs are archived independently. |
+| `users` | `audit_logs` | `user_id` | `CASCADE` | User-scoped audit events; system-level logs are archived independently. Since `0026` the cascade is the only non-retention path that may delete audit rows. |
 | `wallets` | `gas_sponsorship_configs` | `wallet_id` | `CASCADE` | Sponsorship configuration is a 1:1 extension of the sponsoring wallet. |
 | `wallets` | `sponsored_transactions` | `wallet_id` | `RESTRICT` | Fee-bump ledger must be preserved for audit and daily budget calculations. |
 | `wallets` | `withdrawal_allowlist_configs` | `wallet_id` | `CASCADE` | Anti-fraud toggle tied directly to wallet lifecycle. |
@@ -59,6 +59,7 @@ This document serves as the single changelog-style decision index tracking every
 | `0019` | `0019_email_otp.sql` | `email_otps` | Table referencing `users(id) ON DELETE CASCADE`; code hash; purpose CHECK; optional `tx_hash_bound`. | Rate-limited email OTP verification for registration and high-risk withdrawal authorizations. |
 | `0020` | `0020_username.sql` | `users` | Added `username TEXT` with unique partial index on `lower(username)`. | Case-insensitive unique display handles distinct from email addresses. |
 | `0021` | `0021_soft_delete_webhook_endpoints.sql` | `webhook_endpoints` | Added `deleted_at TIMESTAMPTZ` and filtered indices on `(wallet_id)` where `deleted_at IS NULL`. | Soft-delete endpoint path (Issue #338) preventing accidental cascade-purges of `webhook_deliveries` logs. |
+| `0026` | `0026_audit_logs_append_only.sql` | `audit_logs`; functions `audit_logs_retention_allowed`, `audit_logs_block_mutation`, `audit_logs_block_truncate` | `BEFORE UPDATE OR DELETE` row trigger and `BEFORE TRUNCATE` statement trigger raise `insufficient_privilege`. Bypass only for members of `octo_audit_retention` (created out-of-band) or a `DELETE` whose owning `users` row is already gone (FK cascade). Functions pin `search_path = pg_catalog, pg_temp` and schema-qualify `users` via `TG_TABLE_SCHEMA`. | Issue #438: append-only was a convention. A temp table can't spoof the checks; signup rollback still cascades. See `docs/postgres-roles.md`. |
 
 ---
 

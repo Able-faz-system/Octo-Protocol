@@ -23,6 +23,15 @@ async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
     init_tracing();
 
+    // Migrator-role entry point: needs only DATABASE_URL, never the app's secrets.
+    if std::env::args().nth(1).as_deref() == Some("--migrate-only") {
+        let url = std::env::var("DATABASE_URL").context("DATABASE_URL is required")?;
+        let store = Store::connect(&url).await.context("connect to database")?;
+        store.migrate().await.context("run migrations")?;
+        tracing::info!("migrations applied; exiting (--migrate-only)");
+        return Ok(());
+    }
+
     let cfg = Config::from_env()?;
     tracing::info!(network = cfg.network.as_str(), bind = %cfg.bind_addr, "starting octo-server");
 
@@ -30,8 +39,14 @@ async fn main() -> Result<()> {
     let store = Store::connect(&cfg.database_url)
         .await
         .context("connect to database")?;
-    store.migrate().await.context("run migrations")?;
-    tracing::info!("database connected and migrated");
+    // A least-privilege runtime role can't run DDL; migrations then run separately as the
+    // migrator role (see docs/postgres-roles.md).
+    if cfg.run_migrations {
+        store.migrate().await.context("run migrations")?;
+        tracing::info!("database connected and migrated");
+    } else {
+        tracing::info!("database connected (RUN_MIGRATIONS=false, skipping migrations)");
+    }
 
     // Resilience config (shared between API Horizon client and ingest HorizonPayments client).
     let resilience = cfg.resilience.clone();
@@ -66,6 +81,11 @@ async fn main() -> Result<()> {
     if let Some(next) = cfg.master_key_next {
         state = state.with_master_key_next(next);
     }
+    // Fail at boot, not at first signature, on a broken RNG or a key that can't open our data.
+    octo_api::self_test::run(&state)
+        .await
+        .map_err(|e| anyhow::anyhow!("startup crypto self-test failed: {e}"))?;
+    tracing::info!("startup crypto self-test passed");
 
     // Ingest supervisor (background task) — uses its own HorizonPayments client with the same
     // resilience config (separate circuit-breaker instance so ingest and API failures are counted
@@ -242,6 +262,9 @@ struct Config {
     /// tick) before the process force-exits. `SHUTDOWN_DRAIN_TIMEOUT_SECS`, default 25 — keep it
     /// below the orchestrator's kill deadline (Kubernetes `terminationGracePeriodSeconds`: 30).
     shutdown_drain_timeout: Duration,
+    /// `RUN_MIGRATIONS`, default true. Set false when the server connects as a runtime role that
+    /// lacks DDL rights and migrations are applied separately by the migrator role.
+    run_migrations: bool,
     /// Resilience settings for all Horizon clients (API + ingest).
     ///
     /// | Variable | Default | Description |
@@ -319,6 +342,12 @@ impl Config {
                 .unwrap_or(25),
         );
 
+        let run_migrations = match std::env::var("RUN_MIGRATIONS").ok().as_deref() {
+            None | Some("true") | Some("1") => true,
+            Some("false") | Some("0") => false,
+            Some(other) => anyhow::bail!("RUN_MIGRATIONS must be true or false, got {other:?}"),
+        };
+
         let resilience = ResilienceConfig::from_env();
 
         Ok(Config {
@@ -337,6 +366,7 @@ impl Config {
             ingest_interval_secs,
             ingest_page_limit,
             shutdown_drain_timeout,
+            run_migrations,
             resilience,
         })
     }
