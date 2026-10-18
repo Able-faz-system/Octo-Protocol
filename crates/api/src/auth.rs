@@ -7,7 +7,13 @@
 //!  POST /refresh   ──▶ revokes T1, issues T2
 //!  POST /logout    ──▶ revokes T2
 //!  POST /change-password ──▶ revokes every token issued so far, issues T3
+//!  DELETE /sessions/:id  ──▶ revokes one session (any device), effective on its next request
+//!  POST /sessions/revoke-others ──▶ revokes every session but this one, issues T4
 //! ```
+//!
+//! Each sign-in opens a row in `sessions` (migration 0030_sessions.sql) and its id rides in the
+//! JWT's `sid` claim; refresh rotates the token but keeps the session. A token whose session is
+//! revoked or expired is rejected by the same per-request query as the deny-list and epoch.
 //!
 //! Single-token revocation uses a deny-list in Postgres (migration 0008_token_denylist.sql).
 //! Revoking *all* of a user's sessions uses a per-user `session_epoch` (migration
@@ -156,6 +162,19 @@ pub struct Claims {
     pub epoch: i32,
     pub iss: String,
     pub aud: String,
+    /// Session id (`sessions.id`). Absent on tokens issued before session tracking, which stay
+    /// valid until expiry or until "revoke all other sessions" bumps the epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<Uuid>,
+}
+
+/// A verified dashboard login: who, and which session (when the token carries one).
+#[derive(Debug, Clone, Copy)]
+pub struct AuthenticatedSession {
+    pub user_id: Uuid,
+    pub session_id: Option<Uuid>,
+    /// The token's `exp`, for deny-listing it on logout/refresh.
+    pub expires_at: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -283,6 +302,7 @@ pub async fn signup(
 /// `POST /v1/auth/verify-email` — consume a signup OTP and issue the first session token.
 pub async fn verify_email(
     State(state): State<AppState>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Json<Envelope<AuthResponse>>> {
     let req: VerifyEmailRequest = parse_optional(&body)?;
@@ -320,7 +340,7 @@ pub async fn verify_email(
         .send(&user.email, "Welcome to Octo", &welcome_html)
         .await;
 
-    let token = issue_token(state.jwt_secret(), user.id, user.session_epoch)?;
+    let token = start_session(&state, user.id, user.session_epoch, &headers).await?;
     Ok(Envelope::ok(AuthResponse {
         token,
         user: UserView {
@@ -461,7 +481,7 @@ pub async fn login(
     )
     .await;
 
-    let token = issue_token(state.jwt_secret(), user.id, user.session_epoch)?;
+    let token = start_session(&state, user.id, user.session_epoch, &headers).await?;
     Ok(Envelope::ok(
         serde_json::to_value(AuthResponse {
             token,
@@ -478,41 +498,22 @@ pub async fn login(
 /// `POST /v1/auth/refresh` — exchange a valid, unexpired token for a freshly-signed one.
 ///
 /// The caller presents their current JWT via `Authorization: Bearer`; the response carries a new
-/// token for the same user with a full [`TOKEN_TTL_SECS`] window starting now.
-///
-/// **This is not a security control.** Refreshing does **not** invalidate the previous token:
-/// both the old and the new token remain valid until their natural expiry. That is an intentional
-/// scope limit — real revocation (server-side session state / a token denylist) is a separate,
-/// larger piece of work.
+/// token for the same user and session with a full [`TOKEN_TTL_SECS`] window starting now. The
+/// presented token is deny-listed, so a refreshed session leaves exactly one live token.
 pub async fn refresh(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Envelope<AuthResponse>>> {
-    let user_id = authenticate(&headers, &state).await?;
+    let session = authenticate_session(&headers, &state).await?;
     let user = state
         .store()
-        .get_user(user_id)
+        .get_user(session.user_id)
         .await
         .map_err(|_| ApiError::Internal)?
         .ok_or(ApiError::NotFound)?;
 
-    // Rotate, don't just re-issue: deny-list the presented token so a refreshed session leaves
-    // exactly one live token. Without this a leaked token stayed valid for its full TTL even
-    // after the user refreshed.
-    if let Some(old_token) = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-    {
-        if let Some(claims) = verify_token(state.jwt_secret(), old_token) {
-            let expires_at =
-                chrono::DateTime::from_timestamp(claims.exp, 0).unwrap_or_else(chrono::Utc::now);
-            state
-                .store()
-                .denylist_token(&hash_token(old_token), user.id, expires_at)
-                .await
-                .map_err(|_| ApiError::Internal)?;
-        }
+    if let Some(old_token) = bearer(&headers) {
+        denylist(&state, old_token, &session).await?;
     }
 
     crate::audit::record(
@@ -525,7 +526,7 @@ pub async fn refresh(
     )
     .await;
 
-    let token = issue_token(state.jwt_secret(), user.id, user.session_epoch)?;
+    let token = continue_session(&state, &session, user.session_epoch, &headers).await?;
     Ok(Envelope::ok(AuthResponse {
         token,
         user: UserView {
@@ -546,7 +547,8 @@ pub async fn change_password(
 ) -> ApiResult<Json<Envelope<AuthResponse>>> {
     check_auth_rate_limit(&state, &headers, peer.map(|c| c.0)).await?;
     // API keys are wallet-scoped automation credentials; only a login session may do this.
-    let user_id = require_login(&headers, &state).await?;
+    let session = require_login_session(&headers, &state).await?;
+    let user_id = session.user_id;
     // Per-user cap too, so a stolen token can't guess the current password by rotating IPs.
     if !state.rate_limiter().check(
         &user_id.to_string(),
@@ -585,7 +587,7 @@ pub async fn change_password(
 
     let epoch = state
         .store()
-        .change_password(user_id, &hash_password(&new)?)
+        .change_password(user_id, &hash_password(&new)?, session.session_id)
         .await
         .map_err(|_| ApiError::Internal)?;
 
@@ -599,27 +601,8 @@ pub async fn change_password(
     )
     .await;
 
-    let token = issue_token(state.jwt_secret(), user_id, epoch)?;
+    let token = continue_session(&state, &session, epoch, &headers).await?;
 
-    Ok(Envelope::ok(AuthResponse {
-        token,
-        user: UserView {
-            id: user.id,
-            email: user.email,
-            username: user.username,
-        },
-    }))
-}
-
-/// `GET /v1/auth/me` — returns the authenticated user (token required).
-pub async fn me(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> ApiResult<Json<Envelope<UserView>>> {
-    let user_id = authenticate(&headers, &state).await?;
-    let user = state
-        .store()
-        .get_user(user
     Ok(Envelope::ok(AuthResponse {
         token,
         user: UserView {
@@ -929,28 +912,26 @@ pub async fn logout(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Envelope<serde_json::Value>>> {
-    // Extract and validate the token *before* denylisting it — also gives us the user_id and exp.
-    let token = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-        .ok_or(ApiError::Unauthorized)?;
-
+    // Signature + expiry only, so logging out an already-revoked token stays an idempotent no-op.
+    let token = bearer(&headers).ok_or(ApiError::Unauthorized)?;
     let claims = verify_token(state.jwt_secret(), token).ok_or(ApiError::Unauthorized)?;
     let user_id = claims
         .sub
         .parse::<Uuid>()
         .map_err(|_| ApiError::Unauthorized)?;
-
-    // Deny-list the token so it cannot be replayed.
-    let token_hash = hash_token(token);
-    let expires_at =
-        chrono::DateTime::from_timestamp(claims.exp, 0).unwrap_or_else(chrono::Utc::now);
-    state
-        .store()
-        .denylist_token(&token_hash, user_id, expires_at)
-        .await
-        .map_err(|_| ApiError::Internal)?;
+    let session = AuthenticatedSession {
+        user_id,
+        session_id: claims.sid,
+        expires_at: claims.exp,
+    };
+    denylist(&state, token, &session).await?;
+    if let Some(sid) = session.session_id {
+        state
+            .store()
+            .revoke_session(user_id, sid)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+    }
 
     crate::audit::record(
         &state,
@@ -1116,7 +1097,12 @@ fn b64_decode(input: &str) -> Option<Vec<u8>> {
         .ok()
 }
 
-fn issue_token(secret: &[u8], user_id: Uuid, session_epoch: i32) -> Result<String, ApiError> {
+fn issue_token(
+    secret: &[u8],
+    user_id: Uuid,
+    session_epoch: i32,
+    session_id: Option<Uuid>,
+) -> Result<String, ApiError> {
     let claims = Claims {
         sub: user_id.to_string(),
         exp: now_secs() + TOKEN_TTL_SECS,
@@ -1124,6 +1110,7 @@ fn issue_token(secret: &[u8], user_id: Uuid, session_epoch: i32) -> Result<Strin
         epoch: session_epoch,
         iss: jwt_issuer(),
         aud: jwt_audience(),
+        sid: session_id,
     };
     let header = b64(
         &serde_json::to_vec(&JwtHeader {
@@ -1195,6 +1182,71 @@ pub(crate) fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// Session rows expire with the token they were issued for.
+fn session_expiry() -> chrono::DateTime<chrono::Utc> {
+    chrono::Utc::now() + chrono::Duration::seconds(TOKEN_TTL_SECS)
+}
+
+/// SHA-256 hex of the User-Agent header (capped at 512 bytes), or `None` when absent.
+fn user_agent_hash(headers: &HeaderMap) -> Option<String> {
+    use sha2::Digest;
+    let ua = headers.get(axum::http::header::USER_AGENT)?.as_bytes();
+    Some(hex::encode(Sha256::digest(&ua[..ua.len().min(512)])))
+}
+
+/// Open a new session for `user_id` and return its first token.
+async fn start_session(
+    state: &AppState,
+    user_id: Uuid,
+    session_epoch: i32,
+    headers: &HeaderMap,
+) -> Result<String, ApiError> {
+    let session = state
+        .store()
+        .create_session(user_id, user_agent_hash(headers).as_deref(), session_expiry())
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    issue_token(state.jwt_secret(), user_id, session_epoch, Some(session.id))
+}
+
+/// Re-issue a token for the caller's existing session (extending it), or open a new session for a
+/// token that predates session tracking.
+pub(crate) async fn continue_session(
+    state: &AppState,
+    session: &AuthenticatedSession,
+    session_epoch: i32,
+    headers: &HeaderMap,
+) -> Result<String, ApiError> {
+    let Some(sid) = session.session_id else {
+        return start_session(state, session.user_id, session_epoch, headers).await;
+    };
+    let extended = state
+        .store()
+        .extend_session(session.user_id, sid, session_expiry())
+        .await
+        .map_err(|_| ApiError::Internal)?;
+    // Revoked between authentication and here (e.g. from another device): don't resurrect it.
+    if !extended {
+        return Err(ApiError::Unauthorized);
+    }
+    issue_token(state.jwt_secret(), session.user_id, session_epoch, Some(sid))
+}
+
+/// Deny-list `token` until its own expiry so it can't be replayed.
+async fn denylist(
+    state: &AppState,
+    token: &str,
+    session: &AuthenticatedSession,
+) -> Result<(), ApiError> {
+    let expires_at =
+        chrono::DateTime::from_timestamp(session.expires_at, 0).unwrap_or_else(chrono::Utc::now);
+    state
+        .store()
+        .denylist_token(&hash_token(token), session.user_id, expires_at)
+        .await
+        .map_err(|_| ApiError::Internal)
+}
+
 /// SHA-256 hex of a raw token string — used as the deny-list key.
 ///
 /// This is the same pattern used for API key hashing in `routes/apikeys.rs`.
@@ -1224,38 +1276,34 @@ pub async fn authenticate(
     headers: &axum::http::HeaderMap,
     state: &AppState,
 ) -> Result<Uuid, ApiError> {
-    let token = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-        .ok_or(ApiError::Unauthorized)?;
+    authenticate_session(headers, state).await.map(|s| s.user_id)
+}
+
+/// [`authenticate`], also returning the session the token belongs to.
+pub async fn authenticate_session(
+    headers: &axum::http::HeaderMap,
+    state: &AppState,
+) -> Result<AuthenticatedSession, ApiError> {
+    let token = bearer(headers).ok_or(ApiError::Unauthorized)?;
     let claims = verify_token(state.jwt_secret(), token).ok_or(ApiError::Unauthorized)?;
     let user_id = claims
         .sub
         .parse::<Uuid>()
         .map_err(|_| ApiError::Unauthorized)?;
-
-    // Reject tokens revoked individually (deny-list) or en masse (stale session epoch).
+    // Reject tokens revoked individually (deny-list), per session, or en masse (stale epoch).
     let valid = state
         .store()
-        .is_session_valid(&hash_token(token), user_id, claims.epoch)
+        .is_session_valid(&hash_token(token), user_id, claims.epoch, claims.sid)
         .await
         .map_err(|_| ApiError::Internal)?;
     if !valid {
         return Err(ApiError::Unauthorized);
     }
-
-    // A stale epoch (password reset) or a deleted user revokes the token.
-    let epoch = state
-        .store()
-        .get_session_epoch(user_id)
-        .await
-        .map_err(|_| ApiError::Internal)?;
-    if epoch != Some(claims.epoch) {
-        return Err(ApiError::Unauthorized);
-    }
-
-    Ok(user_id)
+    Ok(AuthenticatedSession {
+        user_id,
+        session_id: claims.sid,
+        expires_at: claims.exp,
+    })
 }
 
 /// Prefix that marks an octo API key (vs a dashboard login JWT).
@@ -1341,13 +1389,21 @@ pub async fn require_login(
     headers: &axum::http::HeaderMap,
     state: &AppState,
 ) -> Result<Uuid, ApiError> {
+    require_login_session(headers, state).await.map(|s| s.user_id)
+}
+
+/// [`require_login`], also returning the session the token belongs to.
+pub async fn require_login_session(
+    headers: &axum::http::HeaderMap,
+    state: &AppState,
+) -> Result<AuthenticatedSession, ApiError> {
     if let Some(tok) = bearer(headers) {
         if tok.starts_with(API_KEY_PREFIX) {
             // An API key was presented where a login is required.
             return Err(ApiError::Unauthorized);
         }
     }
-    authenticate(headers, state).await
+    authenticate_session(headers, state).await
 }
 
 #[cfg(test)]
@@ -1368,6 +1424,7 @@ mod tests {
             epoch: 0,
             iss: jwt_issuer(),
             aud: jwt_audience(),
+            sid: None,
         };
         let payload = serde_json::to_vec(&claims).expect("Claims always serialize");
         let header = b64(
@@ -1393,7 +1450,7 @@ mod tests {
     #[test]
     fn tampered_signature_byte_is_rejected() {
         let user_id = Uuid::new_v4();
-        let token = issue_token(SECRET, user_id, 0).expect("issue_token should succeed");
+        let token = issue_token(SECRET, user_id, 0, None).expect("issue_token should succeed");
         let parts: Vec<&str> = token.split('.').collect();
         assert_eq!(parts.len(), 3, "JWT must have header.payload.signature");
 
@@ -1416,7 +1473,7 @@ mod tests {
     #[test]
     fn tampered_payload_byte_is_rejected() {
         let user_id = Uuid::new_v4();
-        let token = issue_token(SECRET, user_id, 0).expect("issue_token should succeed");
+        let token = issue_token(SECRET, user_id, 0, None).expect("issue_token should succeed");
         let parts: Vec<&str> = token.split('.').collect();
         assert_eq!(parts.len(), 3, "JWT must have header.payload.signature");
 
@@ -1440,7 +1497,7 @@ mod tests {
     #[test]
     fn non_standard_header_segment_is_rejected() {
         let user_id = Uuid::new_v4();
-        let token = issue_token(SECRET, user_id, 0).expect("issue_token should succeed");
+        let token = issue_token(SECRET, user_id, 0, None).expect("issue_token should succeed");
         let parts: Vec<&str> = token.split('.').collect();
         assert_eq!(parts.len(), 3, "JWT must have header.payload.signature");
 
@@ -1586,8 +1643,8 @@ mod tests {
     #[test]
     fn token_includes_unique_jti_to_prevent_collision() {
         let user_id = Uuid::new_v4();
-        let token1 = issue_token(SECRET, user_id).expect("issue_token should succeed");
-        let token2 = issue_token(SECRET, user_id).expect("issue_token should succeed");
+        let token1 = issue_token(SECRET, user_id, 0, None).expect("issue_token should succeed");
+        let token2 = issue_token(SECRET, user_id, 0, None).expect("issue_token should succeed");
 
         assert_ne!(token1, token2, "tokens for same user issued in quick succession should differ");
 
@@ -1606,7 +1663,7 @@ mod tests {
     #[test]
     fn token_expires_after_ttl() {
         let user_id = Uuid::new_v4();
-        let token = issue_token(SECRET, user_id).expect("issue_token should succeed");
+        let token = issue_token(SECRET, user_id, 0, None).expect("issue_token should succeed");
         let claims = verify_token(SECRET, &token).expect("token should verify");
 
         let now = now_secs();
@@ -1660,7 +1717,7 @@ mod tests {
     #[test]
     fn verify_token_rejects_tokens_signed_with_different_secret() {
         let user_id = Uuid::new_v4();
-        let token = issue_token(SECRET, user_id).expect("issue_token should succeed");
+        let token = issue_token(SECRET, user_id, 0, None).expect("issue_token should succeed");
 
         let other_secret = b"different-secret-at-least-32-bytes-long!";
         assert!(verify_token(other_secret, &token).is_none());

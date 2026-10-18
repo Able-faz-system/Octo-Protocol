@@ -34,9 +34,13 @@ pub enum StoreError {
     #[error("memo id must be nonnegative")]
     InvalidMemoId,
 
-    /// The wallet is archived; reads are allowed but mutations are rejected.
+    /// The wallet is archived: reads still work, mutations are rejected.
     #[error("wallet is archived")]
     WalletArchived,
+
+    /// The audit hash chain for a user is malformed, so it must not be extended.
+    #[error("audit chain is corrupt")]
+    AuditChainCorrupt,
 }
 
 impl StoreError {

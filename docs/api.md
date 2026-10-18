@@ -19,14 +19,26 @@ Two credential types, with deliberately different power:
 | **Dashboard JWT** | `Authorization: Bearer <token>` | Everything: create wallets, provision a gas tank, read the key backup |
 | **Wallet API key** | `Authorization: Bearer <key>` | Per-wallet operations only. **Cannot** provision a gas tank or read a backup |
 
-Neither can move funds — see below. Tokens carry a unique `jti`; `logout` and `refresh` both
-deny-list the presented token, and every authenticated request checks that deny-list.
+Neither can move funds — see below. Tokens carry a unique `jti` and the id of their login
+session (`sid`); `logout` and `refresh` both deny-list the presented token, and every
+authenticated request checks the deny-list, the session, and the user's session epoch.
 
 - `POST /v1/auth/signup` — create an account, returns a JWT.
 - `POST /v1/auth/login` — returns a JWT.
 - `POST /v1/auth/refresh` — issue a new token **and revoke the presented one**.
-- `POST /v1/auth/logout` — revoke the presented token (a second logout is `401`, not `200`).
+- `POST /v1/auth/logout` — revoke the presented token and its session (repeating it is a
+  harmless `200`).
 - `GET  /v1/auth/me` — the current user.
+- `GET  /v1/auth/sessions` — the caller's live sessions: `id`, `created_at`, `last_seen_at`
+  (updated at most once a minute), `expires_at`, `user_agent_hash` (SHA-256 hex of the sign-in
+  User-Agent) and `current`.
+- `DELETE /v1/auth/sessions/:id` — revoke one session; its token is rejected on its next request.
+  `404` if the id is unknown, already revoked, or another user's.
+- `POST /v1/auth/sessions/revoke-others` — revoke every other session, including tokens issued
+  before session tracking. Returns `{ token, revoked }`: the presented token is invalidated too,
+  so switch to the returned one.
+
+Session endpoints require a dashboard JWT (API keys get `401`).
 
 ## Custody model — read this before the wallet endpoints
 

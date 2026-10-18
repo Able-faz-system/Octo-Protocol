@@ -121,8 +121,6 @@ pub struct User {
     pub session_epoch: i32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    /// Bumped on password change; JWTs carrying an older epoch are rejected.
-    pub session_epoch: i32,
 }
 
 /// A registered webhook endpoint.
@@ -174,6 +172,19 @@ pub struct AuditLog {
     pub target: Option<String>,
     pub ip_address: Option<String>,
     pub created_at: DateTime<Utc>,
+}
+
+/// A dashboard login session (migration 0027). The JWT's `sid` claim names one of these.
+#[derive(Debug, Clone, FromRow)]
+pub struct Session {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    /// SHA-256 hex of the User-Agent header at sign-in; never the raw header.
+    pub user_agent_hash: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
 }
 
 /// A per-wallet API key (only the hash + display prefix are stored).

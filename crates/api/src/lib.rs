@@ -170,6 +170,16 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/auth/me", get(auth::me).patch(auth::update_username))
         .route("/v1/auth/logout", post(auth::logout))
         .route("/v1/auth/change-password", post(auth::change_password))
+        .route("/v1/auth/sessions", get(routes::sessions::list_sessions))
+        // Static segment takes priority over the :id capture below (matchit routing).
+        .route(
+            "/v1/auth/sessions/revoke-others",
+            post(routes::sessions::revoke_other_sessions),
+        )
+        .route(
+            "/v1/auth/sessions/:id",
+            delete(routes::sessions::revoke_session),
+        )
         .route("/v1/audit-logs", get(routes::audit::list_audit_logs))
         .route(
             "/v1/uploads/signature",
