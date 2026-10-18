@@ -85,6 +85,25 @@ async fn security_headers_middleware(req: Request, next: Next) -> Response {
     response
 }
 
+async fn secret_response_cache_middleware(req: Request, next: Next) -> Response {
+    let path = req.uri().path().to_string();
+    let method = req.method().clone();
+    let sensitive = path.starts_with("/v1/auth/")
+        || path.ends_with("/api-key")
+        || path.ends_with("/backup")
+        || (path == "/v1/wallets" && method == axum::http::Method::POST);
+    let mut response = next.run(req).await;
+    if sensitive {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        response
+            .headers_mut()
+            .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    }
+    response
+}
+
 /// Keep API request payloads bounded to a deliberate, documented ceiling.
 ///
 /// These routes deserialize JSON from raw `Bytes`; a `Bytes` extractor alone would otherwise
@@ -106,6 +125,7 @@ pub fn build_router(state: AppState) -> Router {
         .split(',')
         .filter_map(|origin| origin.trim().parse().ok())
         .collect();
+    auth::initialize_dummy_password_hash();
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::list(allowed_origins))
         .allow_methods([
@@ -294,6 +314,7 @@ pub fn build_router(state: AppState) -> Router {
         .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT))
         .layer(cors)
         .layer(middleware::from_fn(security_headers_middleware))
+        .layer(middleware::from_fn(secret_response_cache_middleware))
         .layer(middleware::from_fn(request_id_middleware))
         .with_state(state)
 }

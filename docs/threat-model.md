@@ -105,6 +105,7 @@ responsible for the largest share of real-world crypto theft.
 | Disaster recovery (user wallet) | **The user's responsibility, by design.** Recovery is via their BIP39 mnemonic, or the password-encrypted backup blob octo stores but cannot read. octo has no ability to recover a wallet whose owner has lost both | cutover |
 | Disaster recovery (gas tank) | Gas-tank seeds are server-held and covered by DB backup + master-key rotation (`bin/migrate-keys`) | rotation |
 | Schema migrations silently not applied | sqlx keys migrations by version number, so two files sharing a version means only one ever runs. A test pins the exact applied version set — this had already happened five times before it was caught | 5 |
+| Login email enumeration through response timing | Unknown-email logins verify against a precomputed dummy Argon2 hash, matching the expensive work performed for a known email with a wrong password | auth |
 
 ---
 

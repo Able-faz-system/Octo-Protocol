@@ -392,8 +392,7 @@ pub async fn login(
         .map_err(|_| ApiError::Internal)?;
 
     let Some(user) = user else {
-        let synthetic = hash_password("octo-nonexistent-account")?;
-        let _ = verify_password(&password, &synthetic);
+        let _ = verify_password(&password, dummy_password_hash());
         state
             .store()
             .record_auth_failure(&email)
@@ -1024,6 +1023,18 @@ fn verify_password(password: &str, phc: &str) -> Result<(), ()> {
     Argon2::default()
         .verify_password(password.as_bytes(), &parsed)
         .map_err(|_| ())
+}
+
+fn dummy_password_hash() -> &'static str {
+    static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HASH.get_or_init(|| {
+        hash_password("octo-login-timing-dummy")
+            .expect("constant dummy password must be hashable")
+    })
+}
+
+pub(crate) fn initialize_dummy_password_hash() {
+    let _ = dummy_password_hash();
 }
 
 type HmacSha256 = Hmac<Sha256>;

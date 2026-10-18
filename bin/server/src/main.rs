@@ -16,6 +16,7 @@ use octo_store::Store;
 use octo_wallet_core::StellarNetwork;
 use octo_webhooks::WebhookSender;
 use std::future::IntoFuture;
+use std::fmt;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -282,6 +283,30 @@ struct Config {
     /// | `HORIZON_CB_FAILURE_THRESHOLD` | 5 | Consecutive failures before circuit opens |
     /// | `HORIZON_CB_RESET_TIMEOUT_SECS` | 30 | Seconds before circuit allows a probe |
     resilience: ResilienceConfig,
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Config")
+            .field("database_url", &"[REDACTED]")
+            .field("network", &self.network)
+            .field("horizon_url", &self.horizon_url)
+            .field("friendbot_url", &self.friendbot_url)
+            .field("public_app_url", &self.public_app_url)
+            .field("public_api_url", &self.public_api_url)
+            .field("resend_api_key", &"[REDACTED]")
+            .field("email_from_address", &self.email_from_address)
+            .field("master_key", &"[REDACTED]")
+            .field("master_key_next", &self.master_key_next.as_ref().map(|_| "[REDACTED]"))
+            .field("jwt_secret", &"[REDACTED]")
+            .field("bind_addr", &self.bind_addr)
+            .field("ingest_interval_secs", &self.ingest_interval_secs)
+            .field("ingest_page_limit", &self.ingest_page_limit)
+            .field("shutdown_drain_timeout", &self.shutdown_drain_timeout)
+            .field("resilience", &self.resilience)
+            .finish()
+    }
 }
 
 impl Config {

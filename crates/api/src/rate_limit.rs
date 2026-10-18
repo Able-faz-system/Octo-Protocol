@@ -48,7 +48,10 @@ impl RateLimiter {
     /// Record a hit for `(ip, class)`; false when the fixed window's limit is exceeded.
     pub fn check(&self, ip: &str, class: &'static str, limit: u32, window: Duration) -> bool {
         let now = Instant::now();
-        let mut buckets = self.buckets.lock().expect("rate limiter lock");
+        let mut buckets = self
+            .buckets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         if buckets.len() > SWEEP_THRESHOLD {
             buckets.retain(|_, (start, _)| now.duration_since(*start) < window);
@@ -141,6 +144,19 @@ mod tests {
         assert!(!rl.check("1.2.3.4", "test", 1, window));
         std::thread::sleep(Duration::from_millis(40));
         assert!(rl.check("1.2.3.4", "test", 1, window));
+    }
+
+    #[test]
+    fn poisoned_lock_recovers_for_later_requests() {
+        let limiter = RateLimiter::default();
+        let buckets = Arc::clone(&limiter.buckets);
+        let _ = std::thread::spawn(move || {
+            let _guard = buckets.lock().unwrap();
+            panic!("poison the counter map");
+        })
+        .join();
+
+        assert!(limiter.check("1.2.3.4", "auth", 1, Duration::from_secs(60)));
     }
 
     #[test]

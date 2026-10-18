@@ -10,12 +10,30 @@ use octo_store::Store;
 use octo_wallet_core::StellarNetwork;
 use octo_webhooks::WebhookSender;
 use std::sync::Arc;
+use std::{fmt, fmt::Formatter};
 use zeroize::Zeroizing;
 
 /// Cloneable, shared API state.
 #[derive(Clone)]
 pub struct AppState {
     inner: Arc<Inner>,
+}
+
+impl fmt::Debug for AppState {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AppState")
+            .field("network", &self.inner.network)
+            .field("horizon_url", &self.inner.horizon_url)
+            .field("friendbot_url", &self.inner.friendbot_url)
+            .field("public_app_url", &self.inner.public_app_url)
+            .field("public_api_host", &self.inner.public_api_host)
+            .field("master_key", &"[REDACTED]")
+            .field("master_key_next", &self.inner.master_key_next.as_ref().map(|_| "[REDACTED]"))
+            .field("jwt_secret", &"[REDACTED]")
+            .field("cloudinary", &self.inner.cloudinary.as_ref().map(|_| "[REDACTED]"))
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone)]
