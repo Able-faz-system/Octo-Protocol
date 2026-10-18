@@ -195,10 +195,7 @@ async fn update_batch(
 
 async fn run_backfill(args: Args) -> Result<()> {
     info!("Starting operation_index backfill");
-    info!(
-        "Database URL: {}",
-        args.database_url.chars().take(20).collect::<String>() + "..."
-    );
+    // Never log the URL, even truncated: its prefix is `postgres://user:password`.
     info!("Batch size: {}", args.batch_size);
     info!("Dry run: {}", args.dry_run);
     info!(

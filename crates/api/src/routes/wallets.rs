@@ -357,7 +357,7 @@ pub async fn get_backup(
         "backup",
         crate::rate_limit::BACKUP_USER_LIMIT,
         crate::rate_limit::BACKUP_USER_WINDOW,
-    ) {
+    ).await {
         return Err(ApiError::TooManyRequests(
             "too many backup requests — wait a while and try again".into(),
         ));

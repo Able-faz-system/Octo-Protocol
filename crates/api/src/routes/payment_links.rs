@@ -320,7 +320,7 @@ pub struct PublicPaymentLinkView {
 /// These endpoints have no credential to throttle on, so IP is the only available key. Intent
 /// creation is much tighter than the read paths: each intent allocates a muxed address and
 /// inserts a row, so unbounded calls are a cheap way to bloat the table.
-fn check_public_rate_limit(
+async fn check_public_rate_limit(
     state: &AppState,
     headers: &HeaderMap,
     peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
@@ -332,6 +332,7 @@ fn check_public_rate_limit(
     if state
         .rate_limiter()
         .check(&ip, class, limit, window)
+        .await
     {
         Ok(())
     } else {
@@ -355,7 +356,7 @@ pub async fn get_public_payment_link(
         "pay_read",
         crate::rate_limit::PAY_READ_LIMIT,
         crate::rate_limit::PAY_READ_WINDOW,
-    )?;
+    ).await?;
     let link = state.store().get_payment_link_by_slug(&slug).await?;
     if !link.active {
         return Err(ApiError::NotFound);
@@ -405,7 +406,7 @@ pub async fn create_payment_intent(
         "pay_intent",
         crate::rate_limit::PAY_INTENT_LIMIT,
         crate::rate_limit::PAY_INTENT_WINDOW,
-    )?;
+    ).await?;
     let link = state.store().get_payment_link_by_slug(&slug).await?;
     if !link.active {
         return Err(ApiError::NotFound);
@@ -485,7 +486,7 @@ pub async fn get_payment_status(
         "pay_status",
         crate::rate_limit::PAY_STATUS_LIMIT,
         crate::rate_limit::PAY_STATUS_WINDOW,
-    )?;
+    ).await?;
     let link = state.store().get_payment_link_by_slug(&slug).await?;
     let payment = state
         .store()
@@ -530,7 +531,7 @@ pub async fn public_signing_info(
         "pay_signing_info",
         crate::rate_limit::PAY_SIGNING_INFO_LIMIT,
         crate::rate_limit::PAY_SIGNING_INFO_WINDOW,
-    )?;
+    ).await?;
     // Confirms the link exists/is active before doing any Horizon work on the caller's behalf.
     let link = state.store().get_payment_link_by_slug(&slug).await?;
     if !link.active {
@@ -588,7 +589,7 @@ pub async fn submit_payment(
         "pay_submit",
         crate::rate_limit::PAY_SUBMIT_LIMIT,
         crate::rate_limit::PAY_SUBMIT_WINDOW,
-    )?;
+    ).await?;
     let link = state.store().get_payment_link_by_slug(&slug).await?;
     if !link.active {
         return Err(ApiError::NotFound);

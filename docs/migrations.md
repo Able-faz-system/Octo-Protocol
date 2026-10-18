@@ -60,6 +60,7 @@ This document serves as the single changelog-style decision index tracking every
 | `0020` | `0020_username.sql` | `users` | Added `username TEXT` with unique partial index on `lower(username)`. | Case-insensitive unique display handles distinct from email addresses. |
 | `0021` | `0021_soft_delete_webhook_endpoints.sql` | `webhook_endpoints` | Added `deleted_at TIMESTAMPTZ` and filtered indices on `(wallet_id)` where `deleted_at IS NULL`. | Soft-delete endpoint path (Issue #338) preventing accidental cascade-purges of `webhook_deliveries` logs. |
 | `0026` | `0026_audit_logs_append_only.sql` | `audit_logs`; functions `audit_logs_retention_allowed`, `audit_logs_block_mutation`, `audit_logs_block_truncate` | `BEFORE UPDATE OR DELETE` row trigger and `BEFORE TRUNCATE` statement trigger raise `insufficient_privilege`. Bypass only for members of `octo_audit_retention` (created out-of-band) or a `DELETE` whose owning `users` row is already gone (FK cascade). Functions pin `search_path = pg_catalog, pg_temp` and schema-qualify `users` via `TG_TABLE_SCHEMA`. | Issue #438: append-only was a convention. A temp table can't spoof the checks; signup rollback still cascades. See `docs/postgres-roles.md`. |
+| `0028` | `0028_rate_limit_buckets.sql` | `rate_limit_buckets` | `UNLOGGED`; PK `(key, class)`; index on `expires_at`; no foreign keys. | Shared fixed-window counters so API rate limits hold across replicas and restarts (Issue #445). Unlogged because losing counters on a Postgres crash only resets windows early. |
 
 ---
 

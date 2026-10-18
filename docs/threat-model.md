@@ -92,7 +92,10 @@ responsible for the largest share of real-world crypto theft.
 | Replay of API requests | TLS; mutating on-chain actions are pinned by the signed transaction's sequence number, so a replay is rejected on-chain | 10 |
 | Secrets in env/CI logs | `.env` git-ignored; CI uses masked secrets; no secret echoed in logs | 2 ✓ |
 | Dependency supply-chain (malicious/yanked crate) | `cargo-deny` (advisories + licenses + yanked) in CI; pinned `Cargo.lock`; MSRV-locked tree | 2 ✓ |
-| DoS / resource exhaustion | Request limits, timeouts, connection pool caps; pagination bounds | 6, 11 |
+| DoS / resource exhaustion | Request limits, timeouts, connection pool caps (`DB_*`) and a per-connection `statement_timeout`; pagination bounds | 6, 11 |
+| Rate limits multiplied by replica count / reset by restarts | Counters shared in Postgres (`rate_limit_buckets`, atomic upsert); `X-Forwarded-For` hop must parse as an IP, so junk headers cannot mint unbounded keys | 11 |
+| Dust-payment flood starving other wallets' deposits | Ingest polls round-robin, one page per turn, with a per-wallet per-tick record budget; the backlog carries over via the cursor | 7 |
+| Two ingest replicas burning Horizon quota / racing cursors | Postgres advisory lock elects one ingest leader per network; the leader re-verifies the lock before each tick (`docs/ha-topology.md`) | 7 |
 | Information leak in errors | Typed errors; no internal detail or secret in API responses | 5, 6 |
 
 ### F. Operational / process

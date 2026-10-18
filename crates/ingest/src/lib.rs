@@ -20,7 +20,7 @@ pub mod horizon;
 mod backfill_tests;
 
 use horizon::{HorizonPayments, PaymentRecord};
-use octo_store::{NewDeposit, Store, Wallet};
+use octo_store::{IngestLeaderLock, NewDeposit, Store, Wallet};
 use octo_wallet_core::decode_muxed;
 use octo_webhooks::{Event, WebhookSender};
 use std::collections::HashMap;
@@ -558,9 +558,9 @@ pub enum IngestError {
 
 /// Supervises deposit ingestion across all wallets.
 ///
-/// On each tick it pages through the due wallets and polls each one once (resuming from its
-/// cursor). This is a simple, restart-safe fan-out for the MVP; it can later be split into
-/// per-wallet workers or separate processes for scale without changing the cursor-based contract.
+/// On each tick it pages through the due wallets and polls each one (resuming from its cursor),
+/// round-robin and within a per-wallet budget. Several replicas may run a supervisor against one
+/// database: a Postgres advisory lock elects one leader per network and the rest stand by.
 pub struct Supervisor {
     store: Store,
     horizon_url: String,
@@ -570,7 +570,20 @@ pub struct Supervisor {
     /// Retry/circuit config handed to each per-wallet `Ingestor` built in `tick`.
     retry: octo_resilience::RetryPolicy,
     circuit: octo_resilience::CircuitBreaker,
+    /// How often a standby instance retries the ingest leader lock.
+    lock_retry: Duration,
 }
+
+/// One wallet's progress through a single tick, handed from one page poll to the next.
+struct WalletTurn {
+    ingestor: Ingestor,
+    pages: usize,
+    records: usize,
+}
+
+/// A finished page poll: the wallet's updated turn, the page result, and the limit requested.
+type PageOutcome = (WalletTurn, Result<usize, IngestError>, u32);
+type PollTasks = tokio::task::JoinSet<PageOutcome>;
 
 impl Supervisor {
     pub fn new(
@@ -609,6 +622,7 @@ impl Supervisor {
             tracker: LastPollTracker::new(),
             retry,
             circuit,
+            lock_retry: Self::DEFAULT_LOCK_RETRY,
         }
     }
 
@@ -654,6 +668,10 @@ impl Supervisor {
 
     /// Like [`Supervisor::run`], but returns once `shutdown` is cancelled.
     ///
+    /// Only the instance holding this network's ingest leader lock polls (see
+    /// [`octo_store::IngestLeaderLock`]); every other replica stands by and retries the lock every
+    /// `lock_retry`, so a dead leader is replaced within one retry interval of its session ending.
+    ///
     /// Cancellation is only observed *between* ticks: an in-progress tick always finishes its
     /// current page (deposit rows + cursor), so a rolling deploy never aborts a page halfway.
     /// Bounding how long that may take is the caller's job (see `bin/server`'s drain timeout).
@@ -663,7 +681,54 @@ impl Supervisor {
         page_limit: u32,
         shutdown: CancellationToken,
     ) {
+        while let Some(mut lock) = self.wait_for_leadership(&shutdown).await {
+            tracing::info!(network = self.network, "acquired ingest leader lock; ingesting");
+            self.lead(&mut lock, interval, page_limit, &shutdown).await;
+            // Free the lock promptly so a standby takes over on its next retry, not on TCP timeout.
+            lock.release().await;
+        }
+        tracing::info!("ingest supervisor stopped after finishing its current tick");
+    }
+
+    /// Retry the leader lock every `lock_retry` until it is won (`Some`) or shutdown (`None`).
+    async fn wait_for_leadership(&self, shutdown: &CancellationToken) -> Option<IngestLeaderLock> {
+        let mut announced_standby = false;
         while !shutdown.is_cancelled() {
+            match self.store.try_acquire_ingest_leader(self.network).await {
+                Ok(Some(lock)) => return Some(lock),
+                Ok(None) if !announced_standby => {
+                    tracing::info!(
+                        network = self.network,
+                        retry_secs = self.lock_retry.as_secs(),
+                        "another instance is ingesting; standing by"
+                    );
+                    announced_standby = true;
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(error = ?e, "ingest leader lock attempt failed; will retry"),
+            }
+            tokio::select! {
+                () = tokio::time::sleep(self.lock_retry) => {}
+                () = shutdown.cancelled() => {}
+            }
+        }
+        None
+    }
+
+    /// Tick every `interval` while the lock is held; returns on shutdown or lost leadership.
+    async fn lead(
+        &self,
+        lock: &mut IngestLeaderLock,
+        interval: Duration,
+        page_limit: u32,
+        shutdown: &CancellationToken,
+    ) {
+        while !shutdown.is_cancelled() {
+            // A leader whose lock session died must stop before a standby starts, not after.
+            if !lock.still_held().await {
+                tracing::warn!(network = self.network, "lost ingest leader lock; standing by");
+                return;
+            }
             if let Err(e) = self.tick(page_limit).await {
                 tracing::warn!(error = ?e, "ingest supervisor tick failed; will retry");
             }
@@ -673,79 +738,25 @@ impl Supervisor {
                 () = shutdown.cancelled() => {}
             }
         }
-        tracing::info!("ingest supervisor stopped after finishing its current tick");
     }
 
-    /// One supervision pass: poll every wallet on this network, draining each wallet's backlog
-    /// page by page up to [`Self::MAX_PAGES_PER_TICK`].
+    /// One supervision pass: poll every due wallet on this network, draining each wallet's
+    /// backlog up to [`Self::MAX_RECORDS_PER_WALLET_PER_TICK`] records.
     ///
-    /// Wallets are polled CONCURRENTLY (bounded by [`Self::MAX_CONCURRENT_POLLS`]), not one at a
-    /// time. Sequential polling meant a single slow/unfunded wallet's Horizon round-trip (or
-    /// retry-with-backoff) blocked every wallet behind it in the list — with hundreds of wallets,
-    /// a deposit on a late one could sit unprocessed for minutes despite the nominal poll
-    /// interval. Bounding concurrency (rather than firing all requests at once) keeps Horizon
-    /// request volume sane regardless of how many wallets exist.
+    /// Wallets are polled CONCURRENTLY (bounded by [`Self::MAX_CONCURRENT_POLLS`]) and FAIRLY:
+    /// each task fetches a single page and releases its permit, and a wallet with more waiting is
+    /// requeued behind every page already queued. So a wallet flooded with dust payments gets one
+    /// page per turn like everyone else and can never monopolise a tick; whatever it cannot drain
+    /// within its budget stays behind its cursor for the next tick.
     pub async fn tick(&self, page_limit: u32) -> Result<usize, IngestError> {
         self.expire_stale_payment_link_payments().await;
+        let page_limit = page_limit.clamp(1, Self::MAX_HORIZON_PAGE_LIMIT);
 
         // Only wallets actually due under the backoff tiers — a dev/production DB accumulates
         // wallets that never transact again, and polling them every cycle starves the active ones
         // of the shared concurrency budget. Paged by id so memory doesn't scale with wallet count.
         let semaphore = Arc::new(tokio::sync::Semaphore::new(Self::MAX_CONCURRENT_POLLS));
-        let mut tasks = tokio::task::JoinSet::new();
-        let mut task_wallets = HashMap::new();
-
-        for w in wallets {
-            let wallet_id = w.id;
-            let store = self.store.clone();
-            let store_for_mark = self.store.clone();
-            let horizon_url = self.horizon_url.clone();
-            let webhooks = self.webhooks.clone();
-            let tracker = self.tracker.clone();
-            let retry = self.retry.clone();
-            let circuit = self.circuit.clone();
-            let semaphore = semaphore.clone();
-            let task_id = tasks.spawn(async move {
-                // Held for the duration of this wallet's poll; bounds how many Horizon requests
-                // are in flight at once without limiting how many wallets we *queue*.
-                let _permit = semaphore.acquire_owned().await;
-                let ingestor = Ingestor::new_with_resilience(
-                    store,
-                    &horizon_url,
-                    w.id,
-                    w.stellar_account_g.clone(),
-                    retry,
-                    circuit,
-                )
-                .with_webhooks(webhooks)
-                .with_tracker(tracker);
-                // Drain a backlog page by page; each page persists its own cursor (crash-safe).
-                let mut total = 0;
-                let mut result = Ok(0);
-                for _ in 0..Self::MAX_PAGES_PER_TICK {
-                    let page = ingestor.poll_once(page_limit).await;
-                    // Record the attempt regardless of outcome, so a wallet whose polls keep
-                    // failing still backs off instead of being retried at full rate forever.
-                    let _ = store_for_mark.mark_polled(w.id).await;
-                    match page {
-                        Ok(n) => {
-                            total += n;
-                            result = Ok(total);
-                            if !page_was_full(n, page_limit) {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            result = Err(e);
-                            break;
-                        }
-                    }
-                }
-                (w.id, result)
-            });
-            task_wallets.insert(task_id.id(), wallet_id);
-        }
-
+        let mut tasks = PollTasks::new();
         let mut total = 0;
         let mut after_id = None;
         let mut fetch_error = None;
@@ -774,8 +785,13 @@ impl Supervisor {
             let is_last_page = (page.len() as i64) < Self::FANOUT_PAGE_SIZE;
             after_id = page.last().map(|w| w.id);
 
-            for w in page {
-                self.spawn_poll(&mut tasks, &semaphore, w, page_limit);
+            for w in &page {
+                let turn = WalletTurn {
+                    ingestor: self.ingestor_for(w),
+                    pages: 0,
+                    records: 0,
+                };
+                Self::spawn_page(&mut tasks, &semaphore, turn, page_limit);
             }
             if is_last_page {
                 break;
@@ -783,13 +799,13 @@ impl Supervisor {
             // Backpressure: keep at most about one page of queued tasks before loading the next.
             while tasks.len() > Self::FANOUT_PAGE_SIZE as usize {
                 if let Some(joined) = tasks.join_next().await {
-                    total += Self::tally(joined);
+                    total += Self::settle(joined, &mut tasks, &semaphore, page_limit);
                 }
             }
         }
 
         while let Some(joined) = tasks.join_next().await {
-            total += Self::tally(joined);
+            total += Self::settle(joined, &mut tasks, &semaphore, page_limit);
         }
         match fetch_error {
             Some(e) => Err(e.into()),
@@ -797,66 +813,74 @@ impl Supervisor {
         }
     }
 
-    /// Queue one wallet's poll on `tasks`, gated by the shared concurrency `semaphore`.
-    fn spawn_poll(
-        &self,
-        tasks: &mut tokio::task::JoinSet<(Uuid, Result<usize, IngestError>)>,
-        semaphore: &Arc<tokio::sync::Semaphore>,
-            }
-        }
-
-        while let Some(joined) = tasks.join_next().await {
-            total += Self::tally(joined);
-        }
-        match fetch_error {
-            Some(e) => Err(e.into()),
-            None => Ok(total),
-        }
+    /// Build the per-wallet ingestor with this supervisor's Horizon, webhook and tracker wiring.
+    fn ingestor_for(&self, w: &Wallet) -> Ingestor {
+        Ingestor::new_with_resilience(
+            self.store.clone(),
+            &self.horizon_url,
+            w.id,
+            w.stellar_account_g.clone(),
+            self.retry.clone(),
+            self.circuit.clone(),
+        )
+        .with_webhooks(self.webhooks.clone())
+        .with_tracker(self.tracker.clone())
     }
 
-    /// Queue one wallet's poll on `tasks`, gated by the shared concurrency `semaphore`.
-    fn spawn_poll(
-        &self,
-        tasks: &mut tokio::task::JoinSet<(Uuid, Result<usize, IngestError>)>,
+    /// Queue one page poll for a wallet behind every page already waiting for a permit.
+    ///
+    /// Tokio's semaphore grants permits FIFO, so this is round-robin across wallets, and the
+    /// permit is dropped after the page, so no wallet holds one for its whole backlog.
+    fn spawn_page(
+        tasks: &mut PollTasks,
         semaphore: &Arc<tokio::sync::Semaphore>,
-        w: Wallet,
+        mut turn: WalletTurn,
         page_limit: u32,
     ) {
-        let store = self.store.clone();
-        let horizon_url = self.horizon_url.clone();
-        let webhooks = self.webhooks.clone();
-        let tracker = self.tracker.clone();
-        let retry = self.retry.clone();
-        let circuit = self.circuit.clone();
+        // Never request past the per-tick record budget; the rest carries over via the cursor.
+        let remaining = Self::MAX_RECORDS_PER_WALLET_PER_TICK.saturating_sub(turn.records);
+        let limit = page_limit.min(u32::try_from(remaining).unwrap_or(u32::MAX));
         let semaphore = semaphore.clone();
         tasks.spawn(async move {
-            // Held for the duration of this wallet's poll; bounds how many Horizon requests
-            // are in flight at once without limiting how many wallets we *queue*.
             let _permit = semaphore.acquire_owned().await;
-            let ingestor = Ingestor::new_with_resilience(
-                store.clone(),
-                &horizon_url,
-                w.id,
-                w.stellar_account_g.clone(),
-                retry,
-                circuit,
-            )
-            .with_webhooks(webhooks)
-            .with_tracker(tracker);
-            let result = ingestor.poll_once(page_limit).await;
+            let result = turn.ingestor.poll_once(limit).await;
             // Record the attempt regardless of outcome, so a wallet whose polls keep failing
             // still backs off instead of being retried at full rate forever.
-            let _ = store.mark_polled(w.id).await;
-            (w.id, result)
+            let _ = turn.ingestor.store.mark_polled(turn.ingestor.wallet_id).await;
+            turn.pages += 1;
+            if let Ok(n) = &result {
+                turn.records += *n;
+            }
+            (turn, result, limit)
         });
     }
 
-    /// Count records from one finished poll task, logging failures.
-    fn tally(joined: Result<(Uuid, Result<usize, IngestError>), tokio::task::JoinError>) -> usize {
+    /// Count records from a finished page, requeueing the wallet if it has backlog and budget.
+    fn settle(
+        joined: Result<PageOutcome, tokio::task::JoinError>,
+        tasks: &mut PollTasks,
+        semaphore: &Arc<tokio::sync::Semaphore>,
+        page_limit: u32,
+    ) -> usize {
         match joined {
-            Ok((_wallet_id, Ok(n))) => n,
-            Ok((wallet_id, Err(e))) => {
-                tracing::warn!(wallet = %wallet_id, error = ?e, "wallet poll failed");
+            Ok((turn, Ok(n), limit)) => {
+                if page_was_full(n, limit) {
+                    let within_budget = turn.pages < Self::MAX_PAGES_PER_TICK
+                        && turn.records < Self::MAX_RECORDS_PER_WALLET_PER_TICK;
+                    if within_budget {
+                        Self::spawn_page(tasks, semaphore, turn, page_limit);
+                    } else {
+                        tracing::debug!(
+                            wallet = %turn.ingestor.wallet_id,
+                            records = turn.records,
+                            "per-tick ingest budget reached; backlog resumes next tick"
+                        );
+                    }
+                }
+                n
+            }
+            Ok((turn, Err(e), _)) => {
+                tracing::warn!(wallet = %turn.ingestor.wallet_id, error = ?e, "wallet poll failed");
                 0
             }
             Err(e) => {
@@ -866,6 +890,15 @@ impl Supervisor {
         }
     }
 
+    /// Override how often a standby instance retries the ingest leader lock.
+    pub fn with_lock_retry(mut self, lock_retry: Duration) -> Self {
+        self.lock_retry = lock_retry;
+        self
+    }
+
+    /// Default interval between leader-lock attempts by a standby instance.
+    pub const DEFAULT_LOCK_RETRY: Duration = Duration::from_secs(5);
+
     /// Wallets fetched per page during the fan-out. Bounds both the query size and the number of
     /// queued poll tasks (roughly two pages at most) regardless of total wallet count.
     const FANOUT_PAGE_SIZE: i64 = 500;
@@ -873,14 +906,18 @@ impl Supervisor {
     /// How many wallets to poll concurrently in one [`Supervisor::tick`] pass.
     const MAX_CONCURRENT_POLLS: usize = 20;
 
+    /// Horizon rejects `limit` above 200, so larger `INGEST_PAGE_LIMIT` values are clamped.
+    const MAX_HORIZON_PAGE_LIMIT: u32 = 200;
+
     /// Upper bound on pages one wallet may fetch in a single [`Supervisor::tick`].
-    ///
-    /// Fairness tradeoff: a wallet keeps its concurrency permit while it drains, so an unbounded
-    /// drain would let one recovering wallet pin a permit for its whole backlog. At the default
-    /// `INGEST_PAGE_LIMIT` of 50 this drains up to 500 records per wallet per tick — enough to
-    /// clear a typical outage backlog in one or two ticks — while costing at most 10 Horizon
-    /// round-trips on one of 20 permits, so the other permits keep serving every other wallet.
     const MAX_PAGES_PER_TICK: usize = 10;
+
+    /// Upper bound on records one wallet may process in a single [`Supervisor::tick`].
+    ///
+    /// At the default `INGEST_PAGE_LIMIT` of 50 this matches [`Self::MAX_PAGES_PER_TICK`]: enough
+    /// to clear a typical outage backlog in a tick or two, while a dust flood costs at most this
+    /// many records (and Horizon calls) per tick no matter how large the page limit is set.
+    const MAX_RECORDS_PER_WALLET_PER_TICK: usize = 500;
 
     /// Activity-based backoff tiers. A wallet that saw a deposit within `ACTIVE_AFTER_SECS` is
     /// polled every tick; quieter wallets are polled progressively less often. Deposit latency for

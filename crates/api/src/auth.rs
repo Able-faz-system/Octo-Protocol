@@ -166,7 +166,7 @@ pub struct Claims {
 ///
 /// Blunts credential stuffing and signup spam. Deliberately per-IP rather than per-email — an
 /// attacker rotates emails freely, but not source addresses.
-fn check_auth_rate_limit(
+async fn check_auth_rate_limit(
     state: &AppState,
     headers: &HeaderMap,
     peer: Option<std::net::SocketAddr>,
@@ -174,7 +174,13 @@ fn check_auth_rate_limit(
     let ip = crate::rate_limit::client_ip(headers, peer);
     if state
         .rate_limiter()
-        .check(&ip, "auth", crate::rate_limit::AUTH_RATE_LIMIT, crate::rate_limit::AUTH_RATE_WINDOW)
+        .check(
+            &ip,
+            "auth",
+            crate::rate_limit::AUTH_RATE_LIMIT,
+            crate::rate_limit::AUTH_RATE_WINDOW,
+        )
+        .await
     {
         Ok(())
     } else {
@@ -227,7 +233,7 @@ pub async fn signup(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<(StatusCode, Json<Envelope<VerificationRequiredResponse>>)> {
-    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0))?;
+    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0)).await?;
     let creds: Credentials = parse_optional(&body)?;
     let (email, password) = validate(creds)?;
 
@@ -332,7 +338,7 @@ pub async fn resend_otp(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Json<Envelope<serde_json::Value>>> {
-    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0))?;
+    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0)).await?;
     let req: ResendOtpRequest = parse_optional(&body)?;
     let user_id = req
         .user_id
@@ -344,7 +350,7 @@ pub async fn resend_otp(
         "otp_resend",
         crate::rate_limit::OTP_RESEND_USER_LIMIT,
         crate::rate_limit::OTP_RESEND_USER_WINDOW,
-    ) {
+    ).await {
         return Err(ApiError::TooManyRequests(
             "too many resend attempts — wait a while and try again".into(),
         ));
@@ -355,7 +361,7 @@ pub async fn resend_otp(
         "otp_resend_ip",
         crate::rate_limit::OTP_RESEND_IP_LIMIT,
         crate::rate_limit::OTP_RESEND_IP_WINDOW,
-    ) {
+    ).await {
         return Err(ApiError::TooManyRequests(
             "too many resend attempts — wait a while and try again".into(),
         ));
@@ -379,7 +385,7 @@ pub async fn login(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Json<Envelope<serde_json::Value>>> {
-    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0))?;
+    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0)).await?;
     let creds: Credentials = parse_optional(&body)?;
     let (email, password) = validate(creds)?;
 
@@ -538,7 +544,7 @@ pub async fn change_password(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Json<Envelope<AuthResponse>>> {
-    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0))?;
+    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0)).await?;
     // API keys are wallet-scoped automation credentials; only a login session may do this.
     let user_id = require_login(&headers, &state).await?;
     // Per-user cap too, so a stolen token can't guess the current password by rotating IPs.
@@ -547,7 +553,7 @@ pub async fn change_password(
         "change_password",
         CHANGE_PASSWORD_ATTEMPTS,
         std::time::Duration::from_secs(15 * 60),
-    ) {
+    ).await {
         return Err(ApiError::TooManyRequests(
             "too many attempts — wait a while and try again".into(),
         ));
@@ -690,7 +696,7 @@ async fn send_password_reset_otp(state: &AppState, email: &str) -> Result<(), Ap
         "pw_reset_send",
         3,
         std::time::Duration::from_secs(60 * 60),
-    ) {
+    ).await {
         return Ok(());
     }
     issue_otp(state, user.id, "password_reset", &user.email, None).await
@@ -706,7 +712,7 @@ pub async fn request_password_reset(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Json<Envelope<serde_json::Value>>> {
-    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0))?;
+    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0)).await?;
     let req: RequestPasswordResetRequest = parse_optional(&body)?;
     let email = normalize_email(req.email)?;
 
@@ -726,7 +732,7 @@ pub async fn confirm_password_reset(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Json<Envelope<serde_json::Value>>> {
-    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0))?;
+    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0)).await?;
     let req: ConfirmPasswordResetRequest = parse_optional(&body)?;
     // Validate the password first so a typo doesn't burn the one-time code.
     let (email, new_password) = validate(Credentials {
@@ -785,7 +791,7 @@ pub async fn request_email_change(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Json<Envelope<serde_json::Value>>> {
-    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0))?;
+    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0)).await?;
     let user_id = require_login(&headers, &state).await?;
     let req: RequestEmailChangeRequest = parse_optional(&body)?;
     let new_email = normalize_email(req.new_email)?;
@@ -800,7 +806,7 @@ pub async fn request_email_change(
         "email_change_request",
         5,
         std::time::Duration::from_secs(60 * 60),
-    ) {
+    ).await {
         return Err(ApiError::TooManyRequests(
             "too many attempts — wait a while and try again".into(),
         ));
@@ -848,7 +854,7 @@ pub async fn confirm_email_change(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Json<Envelope<UserView>>> {
-    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0))?;
+    check_auth_rate_limit(&state, &headers, peer.map(|c| c.0)).await?;
     let user_id = require_login(&headers, &state).await?;
     let req: ConfirmEmailChangeRequest = parse_optional(&body)?;
     let new_email = normalize_email(req.new_email)?;

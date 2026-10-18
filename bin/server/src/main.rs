@@ -8,11 +8,12 @@
 mod mainnet_guard;
 
 use anyhow::{Context, Result};
+use octo_api::rate_limit::{RateLimitBackend, RateLimiter};
 use octo_api::{build_router, AppState};
 use octo_email::EmailSender;
 use octo_ingest::Supervisor;
 use octo_resilience::ResilienceConfig;
-use octo_store::Store;
+use octo_store::{Store, StoreConfig};
 use octo_wallet_core::StellarNetwork;
 use octo_webhooks::WebhookSender;
 use std::future::IntoFuture;
@@ -44,7 +45,18 @@ async fn main() -> Result<()> {
     tracing::info!(network = cfg.network.as_str(), bind = %cfg.bind_addr, "starting octo-server");
 
     // Database.
-    let store = Store::connect(&cfg.database_url)
+    let db = &cfg.store;
+    tracing::info!(
+        max_connections = db.max_connections,
+        acquire_timeout_secs = db.acquire_timeout.as_secs(),
+        idle_timeout_secs = db.idle_timeout.as_secs(),
+        statement_timeout_secs = db.statement_timeout.as_secs(),
+        "database pool config"
+    );
+    if db.statement_timeout.is_zero() {
+        tracing::warn!("DB_STATEMENT_TIMEOUT_SECS=0: statements may run unbounded");
+    }
+    let store = Store::connect_with(&cfg.database_url, db)
         .await
         .context("connect to database")?;
     // A least-privilege runtime role can't run DDL; migrations then run separately as the
@@ -94,6 +106,10 @@ async fn main() -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("startup crypto self-test failed: {e}"))?;
     tracing::info!("startup crypto self-test passed");
+    // Postgres-backed limits hold across replicas and restarts; memory is per-process only.
+    let rate_limiter = RateLimiter::for_backend(cfg.rate_limit_backend, store.clone());
+    state = state.with_rate_limiter(rate_limiter.clone());
+    tracing::info!(backend = cfg.rate_limit_backend.as_str(), "rate limiter configured");
 
     // Ingest supervisor (background task) — uses its own HorizonPayments client with the same
     // resilience config (separate circuit-breaker instance so ingest and API failures are counted
@@ -107,7 +123,8 @@ async fn main() -> Result<()> {
         cfg.network.as_str(),
         ingest_retry,
         ingest_circuit,
-    );
+    )
+    .with_lock_retry(cfg.ingest_lock_retry);
     // Cancelled on SIGTERM/SIGINT; both the ingest loop and the HTTP server drain on it.
     let shutdown = CancellationToken::new();
     let ingest = tokio::spawn(supervisor.run_until_cancelled(
@@ -117,8 +134,22 @@ async fn main() -> Result<()> {
     ));
     tracing::info!(
         interval_secs = cfg.ingest_interval_secs,
-        "deposit ingest supervisor started"
+        lock_retry_secs = cfg.ingest_lock_retry.as_secs(),
+        "deposit ingest supervisor started (ingests only while holding the leader lock)"
     );
+
+    // Prune expired rate-limit windows so the shared table stays bounded.
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            match rate_limiter.prune().await {
+                Ok(count) if count > 0 => tracing::debug!(count, "pruned expired rate-limit windows"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = ?e, "failed to prune rate-limit windows"),
+            }
+        }
+    });
 
     // Periodic background sweep to reconcile sponsorships stuck pending after a crash.
     let sweep_store = store.clone();
@@ -246,6 +277,11 @@ fn init_tracing() {
 /// Server configuration, read from environment variables.
 struct Config {
     database_url: String,
+    /// Pool size and timeouts (`DB_MAX_CONNECTIONS`, `DB_ACQUIRE_TIMEOUT_SECS`,
+    /// `DB_IDLE_TIMEOUT_SECS`, `DB_STATEMENT_TIMEOUT_SECS`); see [`StoreConfig`].
+    store: StoreConfig,
+    /// `RATE_LIMIT_BACKEND`: `postgres` (default, shared across replicas) or `memory`.
+    rate_limit_backend: RateLimitBackend,
     network: StellarNetwork,
     horizon_url: String,
     friendbot_url: Option<String>,
@@ -266,6 +302,9 @@ struct Config {
     bind_addr: String,
     ingest_interval_secs: u64,
     ingest_page_limit: u32,
+    /// `INGEST_LOCK_RETRY_SECS`, default 5: how often a standby retries the ingest leader lock,
+    /// which bounds failover time once the leader's session ends.
+    ingest_lock_retry: Duration,
     /// Upper bound on the graceful-shutdown drain (in-flight HTTP requests + the current ingest
     /// tick) before the process force-exits. `SHUTDOWN_DRAIN_TIMEOUT_SECS`, default 25 — keep it
     /// below the orchestrator's kill deadline (Kubernetes `terminationGracePeriodSeconds`: 30).
@@ -328,6 +367,14 @@ impl Config {
 
     fn from_env() -> Result<Config> {
         let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL is required")?;
+        let store = StoreConfig::from_env()?;
+
+        let rate_limit_backend = match std::env::var("RATE_LIMIT_BACKEND") {
+            Ok(raw) => RateLimitBackend::parse(&raw).with_context(|| {
+                format!("RATE_LIMIT_BACKEND must be `postgres` or `memory` (got {raw:?})")
+            })?,
+            Err(_) => RateLimitBackend::Postgres,
+        };
 
         let network_str = std::env::var("NETWORK").unwrap_or_else(|_| "testnet".to_string());
         // Accepted values: "mainnet" | "public", "testnet" | "test", "standalone".
@@ -383,6 +430,14 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(50);
 
+        let ingest_lock_retry = match std::env::var("INGEST_LOCK_RETRY_SECS") {
+            Ok(raw) => match raw.trim().parse::<u64>() {
+                Ok(secs) if secs >= 1 => Duration::from_secs(secs),
+                _ => anyhow::bail!("INGEST_LOCK_RETRY_SECS must be a whole number >= 1 (got {raw:?})"),
+            },
+            Err(_) => Supervisor::DEFAULT_LOCK_RETRY,
+        };
+
         let shutdown_drain_timeout = Duration::from_secs(
             std::env::var("SHUTDOWN_DRAIN_TIMEOUT_SECS")
                 .ok()
@@ -400,6 +455,8 @@ impl Config {
 
         Ok(Config {
             database_url,
+            store,
+            rate_limit_backend,
             network,
             horizon_url,
             friendbot_url,
@@ -413,6 +470,7 @@ impl Config {
             bind_addr,
             ingest_interval_secs,
             ingest_page_limit,
+            ingest_lock_retry,
             shutdown_drain_timeout,
             run_migrations,
             resilience,
