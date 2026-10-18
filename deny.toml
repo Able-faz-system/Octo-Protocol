@@ -7,6 +7,11 @@ yanked = "deny"
 # here would be reported as "no crate matched advisory criteria".
 # Re-check on every dependency bump — an exception that gains a reverse-dependency path stops
 # being an exception and becomes a real finding.
+#
+# Re-checked for the evm-core / evm-rpc dependency surface (#217, #218): the secp256k1/BIP-32
+# stack (k256, elliptic-curve, bip32, sha2, hmac, zeroize), sha3/keccak, alloy-primitives, and the
+# evm-rpc client (reqwest/rustls, serde_json) do not introduce a reverse-dependency path to either
+# ignored advisory below. Both exceptions remain scoped to their original crates.
 ignore = [
     # Reachable via stellar-base, but unmaintained-only with no safe upgrade published. Tracked as
     # a dependency-replacement task rather than silently accepted forever.

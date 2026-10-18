@@ -9,6 +9,8 @@ members = [
     "crates/ingest",
     "crates/api",
     "crates/resilience",
+    "crates/evm-core",
+    "crates/evm-rpc",
     "bin/server",
     "bin/migrate-keys",
     "bin/backfill-operation-index",
@@ -41,6 +43,17 @@ hex = "0.4.3"
 base64 = "0.22"
 argon2 = "0.5"
 subtle = "2.6"
+
+# --- EVM / secp256k1 ---
+# k256 provides secp256k1 signing/recovery with low-s normalisation (EIP-2).
+k256 = { version = "0.13.4", default-features = false, features = ["ecdsa", "arithmetic"] }
+# sha3 provides keccak-256 for EVM address derivation.
+sha3 = "0.10.8"
+# bip32 provides BIP-32/BIP-44 hierarchical deterministic derivation over secp256k1.
+bip32 = { version = "0.5.2", default-features = false, features = ["secp256k1"] }
+# alloy-primitives supplies U256 and the EIP-55 address type used by the RPC client.
+alloy-primitives = { version = "0.8.25", default-features = false, features = ["serde", "std"] }
+
 # Note: the MSRV-aware resolver (.cargo/config.toml: incompatible-rust-versions = "fallback")
 # keeps the whole tree on Rust-1.84-compatible versions, so no manual transitive pins are needed.
 
@@ -77,6 +90,8 @@ octo-email = { path = "crates/email" }
 octo-ingest = { path = "crates/ingest" }
 octo-api = { path = "crates/api" }
 octo-resilience = { path = "crates/resilience" }
+octo-evm-core = { path = "crates/evm-core" }
+octo-evm-rpc = { path = "crates/evm-rpc" }
 
 [profile.release]
 lto = "thin"
