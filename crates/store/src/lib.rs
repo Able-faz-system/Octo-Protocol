@@ -407,6 +407,15 @@ impl Store {
         Ok(row)
     }
 
+    pub async fn rehash_password(&self, user_id: Uuid, password_hash: &str) -> Result<(), StoreError> {
+        sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
+            .bind(user_id)
+            .bind(password_hash)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Delete (revoke) the API key for a wallet. Returns `Ok(())` even if no key existed.
     pub async fn delete_api_key(&self, wallet_id: Uuid) -> Result<(), StoreError> {
         sqlx::query("DELETE FROM api_keys WHERE wallet_id = $1")
