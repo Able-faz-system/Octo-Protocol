@@ -36,7 +36,7 @@ jobs:
       # hermetic; this URL lets the store integration tests run against the Postgres service.
       DATABASE_URL: postgres://octo:octo@localhost:5432/octo
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
         # SHA-pinned (see the `pinned-actions` job) and passed the Rust toolchain version
@@ -59,7 +59,7 @@ jobs:
         # main-branch cache so the warm cache starts from a known-good baseline rather
         # than a per-PR reproduction.
         # Supersedes part of #34 / #35; closes Octo-Protocol-org/Octo-Protocol#33.
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: false
           shared-cache: true
@@ -84,12 +84,12 @@ jobs:
     name: cargo-audit (RUSTSEC advisories)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set cache key date
         id: cache-date
         run: echo "date=$(date -u +'%Y-%m-%d')" >> $GITHUB_OUTPUT
       - name: Cache cargo-audit binary and advisory DB
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/bin/cargo-audit
@@ -113,12 +113,12 @@ jobs:
     name: cargo-deny (licenses + advisories)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set cache key date
         id: cache-date
         run: echo "date=$(date -u +'%Y-%m-%d')" >> $GITHUB_OUTPUT
       - name: Cache cargo-deny advisory DB
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/advisory-dbs
@@ -131,7 +131,7 @@ jobs:
     name: gitleaks (secret scanning)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Full history: a secret that was committed and later deleted is still a leaked secret.
           fetch-depth: 0
@@ -156,7 +156,7 @@ jobs:
     name: GitHub Actions pinned to commit SHAs
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Reject unpinned actions
         run: scripts/check-pinned-actions.sh
 
@@ -189,8 +189,8 @@ jobs:
       JWT_SECRET: supersecretjwtkeyforminimumnsixteenbytes
       BIND_ADDR: 0.0.0.0:8080
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 20
       - name: Install Rust toolchain
@@ -198,7 +198,7 @@ jobs:
         with:
           toolchain: 1.84.1
       - name: Cache cargo
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: false
           shared-cache: true
