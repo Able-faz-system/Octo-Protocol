@@ -1027,7 +1027,18 @@ fn verify_password(password: &str, phc: &str) -> Result<(), ()> {
 }
 
 type HmacSha256 = Hmac<Sha256>;
-const JWT_HEADER_B64: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
+
+#[derive(Serialize, Deserialize)]
+struct JwtHeader {
+    alg: String,
+    typ: String,
+    kid: String,
+}
+
+fn jwt_key_id(secret: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(&Sha256::digest(secret)[..8])
+}
 
 fn b64(input: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(input)
@@ -1044,10 +1055,18 @@ fn issue_token(secret: &[u8], user_id: Uuid, session_epoch: i32) -> Result<Strin
         sub: user_id.to_string(),
         exp: now_secs() + TOKEN_TTL_SECS,
         jti: Uuid::new_v4().to_string(),
-fn issue_token(secret: &[u8], user_id: Uuid, session_epoch: i32) -> Result<String, ApiError> {
+        epoch: session_epoch,
     };
+    let header = b64(
+        &serde_json::to_vec(&JwtHeader {
+            alg: "HS256".into(),
+            typ: "JWT".into(),
+            kid: jwt_key_id(secret),
+        })
+        .map_err(|_| ApiError::Internal)?,
+    );
     let payload = serde_json::to_vec(&claims).map_err(|_| ApiError::Internal)?;
-    let signing_input = format!("{JWT_HEADER_B64}.{}", b64(&payload));
+    let signing_input = format!("{header}.{}", b64(&payload));
     let sig = sign_hs256(secret, signing_input.as_bytes());
     Ok(format!("{signing_input}.{sig}"))
 }
@@ -1058,11 +1077,24 @@ pub fn verify_token(secret: &[u8], token: &str) -> Option<Claims> {
     let header = parts.next()?;
     let payload = parts.next()?;
     let signature = parts.next()?;
-    if parts.next().is_some() || header != JWT_HEADER_B64 {
+    if parts.next().is_some() {
         return None;
     }
+    let header_data: JwtHeader = serde_json::from_slice(&b64_decode(header)?).ok()?;
+    if header_data.alg != "HS256" || header_data.typ != "JWT" {
+        return None;
+    }
+    let previous = std::env::var("JWT_SECRET_PREVIOUS").ok();
+    let verification_secret = if header_data.kid == jwt_key_id(secret) {
+        secret
+    } else {
+        previous
+            .as_deref()
+            .map(str::as_bytes)
+            .filter(|previous| header_data.kid == jwt_key_id(previous))?
+    };
     let signing_input = format!("{header}.{payload}");
-    if !verify_hs256(secret, signing_input.as_bytes(), signature) {
+    if !verify_hs256(verification_secret, signing_input.as_bytes(), signature) {
         return None;
     }
     let claims: Claims = serde_json::from_slice(&b64_decode(payload)?).ok()?;
@@ -1151,7 +1183,7 @@ pub async fn authenticate(
         .get_session_epoch(user_id)
         .await
         .map_err(|_| ApiError::Internal)?;
-    if epoch != Some(claims.ep) {
+    if epoch != Some(claims.epoch) {
         return Err(ApiError::Unauthorized);
     }
 
@@ -1177,6 +1209,13 @@ fn hash_api_key(key: &str) -> String {
     hex::encode(h.finalize())
 }
 
+fn has_valid_api_key_checksum(key: &str) -> bool {
+    let Some((body, supplied)) = key.rsplit_once('_') else {
+        return false;
+    };
+    supplied.len() == 8 && hash_api_key(body).starts_with(supplied)
+}
+
 /// Authorize a request to operate on `wallet_id`, accepting **either**:
 /// - a dashboard login JWT whose user **owns** the wallet, or
 /// - an `octo_sk_…` API key whose wallet **is** `wallet_id` (the key implies its wallet).
@@ -1188,18 +1227,33 @@ pub async fn authorize_wallet(
     state: &AppState,
     wallet_id: Uuid,
 ) -> Result<(), ApiError> {
+    authorize_wallet_scope(headers, state, wallet_id, "read").await
+}
+
+pub async fn authorize_wallet_scope(
+    headers: &axum::http::HeaderMap,
+    state: &AppState,
+    wallet_id: Uuid,
+    required_scope: &str,
+) -> Result<(), ApiError> {
     let token = bearer(headers).ok_or(ApiError::Unauthorized)?;
 
     if let Some(_key) = token.strip_prefix(API_KEY_PREFIX) {
+        if !has_valid_api_key_checksum(token) {
+            return Err(ApiError::Unauthorized);
+        }
         // API-key path: the key maps to exactly one wallet.
-        let key_wallet = state
+        let key = state
             .store()
-            .wallet_id_for_key_hash(&hash_api_key(token))
+            .use_api_key(&hash_api_key(token))
             .await
             .map_err(|_| ApiError::Internal)?
             .ok_or(ApiError::Unauthorized)?;
-        if key_wallet != wallet_id {
+        if key.wallet_id != wallet_id {
             return Err(ApiError::NotFound);
+        }
+        if !key.scopes.iter().any(|scope| scope == required_scope) {
+            return Err(ApiError::Forbidden("API key lacks the required scope".into()));
         }
         return Ok(());
     }
@@ -1243,10 +1297,18 @@ mod tests {
             sub: user_id.to_string(),
             exp,
             jti: Uuid::new_v4().to_string(),
-            exp: 0,
+            epoch: 0,
         };
         let payload = serde_json::to_vec(&claims).expect("Claims always serialize");
-        let signing_input = format!("{JWT_HEADER_B64}.{}", b64(&payload));
+        let header = b64(
+            &serde_json::to_vec(&JwtHeader {
+                alg: "HS256".into(),
+                typ: "JWT".into(),
+                kid: jwt_key_id(secret),
+            })
+            .unwrap(),
+        );
+        let signing_input = format!("{header}.{}", b64(&payload));
         let sig = sign_hs256(secret, signing_input.as_bytes());
         format!("{signing_input}.{sig}")
     }
@@ -1316,14 +1378,14 @@ mod tests {
         // signature segment is irrelevant here: verify_token must reject on the header check
         // alone, before ever reaching signature verification.
         let none_header = b64(br#"{"alg":"none","typ":"JWT"}"#);
-        assert_ne!(none_header, JWT_HEADER_B64);
+        assert_ne!(none_header, parts[0]);
         let tampered = format!("{}.{}.{}", none_header, parts[1], parts[2]);
         assert!(verify_token(SECRET, &tampered).is_none());
 
         // Also confirm a header that isn't even valid JSON (garbage bytes) is rejected the
         // same way, and doesn't panic.
         let garbage_header = b64(b"not-a-jwt-header");
-        assert_ne!(garbage_header, JWT_HEADER_B64);
+        assert_ne!(garbage_header, parts[0]);
         let tampered = format!("{}.{}.{}", garbage_header, parts[1], parts[2]);
         assert!(verify_token(SECRET, &tampered).is_none());
 

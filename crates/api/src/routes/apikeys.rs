@@ -23,6 +23,8 @@ pub struct GenerateKeyRequest {
     /// Must be `true` to rotate an existing key (which immediately invalidates the old one).
     #[serde(default)]
     pub confirm: Option<bool>,
+    pub scopes: Option<Vec<String>>,
+    pub expires_in_days: Option<u32>,
 }
 
 /// Returned once when a key is generated — includes the full secret.
@@ -41,6 +43,9 @@ pub struct ApiKeyInfo {
     pub configured: bool,
     /// Non-secret display prefix, e.g. "octo_sk_test_ab12".
     pub prefix: Option<String>,
+    pub scopes: Vec<String>,
+    pub last_used_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Confirm the authenticated user owns the wallet; returns the wallet network.
@@ -64,6 +69,10 @@ fn hash_key(key: &str) -> String {
     hex::encode(h.finalize())
 }
 
+fn checksum(value: &str) -> String {
+    hash_key(value)[..8].to_string()
+}
+
 /// `POST /v1/wallets/:id/api-key` — generate the wallet's API key, or rotate it with
 /// `{"confirm": true}`. Without confirmation an existing key is never replaced (409), so a
 /// double-click or retried request can't silently break every integration using the old key.
@@ -76,6 +85,19 @@ pub async fn generate_key(
     let wallet = owned_wallet(&state, &headers, id).await?;
     let req: GenerateKeyRequest = parse_optional(&body)?;
     let rotate = req.confirm == Some(true);
+    let scopes = req
+        .scopes
+        .unwrap_or_else(|| vec!["read".into(), "write".into(), "sponsor".into()]);
+    if scopes.is_empty()
+        || scopes
+            .iter()
+            .any(|scope| !matches!(scope.as_str(), "read" | "write" | "sponsor"))
+    {
+        return Err(ApiError::BadRequest("invalid API key scopes".into()));
+    }
+    let expires_at = req.expires_in_days.map(|days| {
+        chrono::Utc::now() + chrono::Duration::days(i64::from(days.clamp(1, 365)))
+    });
 
     // octo_sk_<network>_<32 hex chars>
     let mut raw = [0u8; 16];
@@ -85,16 +107,21 @@ pub async fn generate_key(
     } else {
         "test"
     };
-    let api_key = format!("octo_sk_{net}_{}", hex::encode(raw));
+    let key_body = format!("octo_sk_{net}_{}", hex::encode(raw));
+    let api_key = format!("{key_body}_{}", checksum(&key_body));
     // Display prefix: scheme + first 4 random chars.
     let prefix = format!("octo_sk_{net}_{}", &hex::encode(raw)[..4]);
 
     // Insert-only unless rotation is confirmed: atomic on wallet_id, so no check-then-write race.
     let (store, key_hash) = (state.store(), hash_key(&api_key));
     let stored = if rotate {
-        store.upsert_api_key(id, &prefix, &key_hash).await
+        store
+            .upsert_api_key(id, &prefix, &key_hash, &scopes, expires_at)
+            .await
     } else {
-        store.create_api_key(id, &prefix, &key_hash).await
+        store
+            .create_api_key(id, &prefix, &key_hash, &scopes, expires_at)
+            .await
     };
     match stored {
         Ok(_) => {}
@@ -176,6 +203,9 @@ pub async fn get_key(
     Ok(Envelope::ok(ApiKeyInfo {
         wallet_id: id,
         configured: key.is_some(),
-        prefix: key.map(|k| k.prefix),
+        prefix: key.as_ref().map(|key| key.prefix.clone()),
+        scopes: key.as_ref().map(|key| key.scopes.clone()).unwrap_or_default(),
+        last_used_at: key.as_ref().and_then(|key| key.last_used_at.clone()),
+        expires_at: key.and_then(|key| key.expires_at),
     }))
 }

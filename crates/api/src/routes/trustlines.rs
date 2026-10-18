@@ -4,7 +4,7 @@
 //! data returned here, signs it with its own key, and relays it via
 //! `POST /v1/wallets/:id/submit-signed` (whose op allowlist already admits change-trust).
 
-use crate::auth::authorize_wallet;
+use crate::auth::authorize_wallet_scope;
 use crate::error::{ApiError, ApiResult, Envelope};
 use crate::json::parse_optional;
 use crate::state::AppState;
@@ -54,7 +54,7 @@ pub async fn add_trustline(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Json<Envelope<TrustlineSigningInfo>>> {
-    authorize_wallet(&headers, &state, wallet_id).await?;
+    authorize_wallet_scope(&headers, &state, wallet_id, "write").await?;
     let req: TrustlineRequest = parse_optional(&body)?;
     let asset_code = req
         .asset_code

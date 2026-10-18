@@ -180,6 +180,9 @@ pub struct ApiKey {
     pub prefix: String,
     pub key_hash: String,
     pub created_at: DateTime<Utc>,
+    pub scopes: Vec<String>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 /// A sponsored (fee-bump) transaction record.

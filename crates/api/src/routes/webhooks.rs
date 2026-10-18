@@ -1,6 +1,6 @@
 //! Webhook endpoint registration.
 
-use crate::auth::authorize_wallet;
+use crate::auth::{authorize_wallet, authorize_wallet_scope};
 use crate::error::{ApiError, ApiResult, Envelope};
 use crate::json::parse_optional;
 use crate::state::AppState;
@@ -37,7 +37,7 @@ pub async fn create_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<(StatusCode, Json<Envelope<WebhookView>>)> {
-    authorize_wallet(&headers, &state, wallet_id).await?;
+    authorize_wallet_scope(&headers, &state, wallet_id, "write").await?;
     let req: CreateWebhookRequest = parse_optional(&body)?;
     let url = req
         .url
@@ -142,7 +142,7 @@ pub async fn delete_webhook(
     Path((wallet_id, endpoint_id)): Path<(Uuid, Uuid)>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Envelope<serde_json::Value>>> {
-    authorize_wallet(&headers, &state, wallet_id).await?;
+    authorize_wallet_scope(&headers, &state, wallet_id, "write").await?;
 
     let endpoint = state.store().get_webhook_endpoint(endpoint_id).await?;
     if endpoint.wallet_id != wallet_id {
