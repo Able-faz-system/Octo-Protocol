@@ -90,10 +90,26 @@ carries fee float only — the one server-held key in the system, bounded by you
 - `DELETE /v1/wallets/{id}/webhooks/{endpoint_id}` — deactivate (soft delete, so the delivery
   history survives as an audit trail).
 - `GET    /v1/wallets/{id}/webhooks/{endpoint_id}/deliveries` — delivery history (`?limit=`,
-  default 50, max 200).
+  default 50, max 200; `?status=pending|delivered|failed|dead` to filter, e.g. the dead-letter
+  queue).
+- `POST   /v1/wallets/{id}/webhooks/{endpoint_id}/test` — send a signed `ping` event and return
+  the result (one attempt, recorded in history, 5/min per endpoint).
+- `POST   /v1/wallets/{id}/webhooks/{endpoint_id}/deliveries/{delivery_id}/redeliver` — re-send
+  a past event with its original `data` plus `redelivery_of`/`redelivered_at` (active endpoints
+  only, 10/min per endpoint, audit-logged).
 
 Deliveries are signed `HMAC-SHA256` over the raw body. Endpoint URLs are SSRF-screened:
 loopback, private and link-local targets are rejected, IPv4 and bracketed IPv6 alike.
+
+A delivery whose retries are exhausted ends in the terminal `dead` status. Set
+`OCTO_WEBHOOK_AUTO_DISABLE_AFTER=N` to deactivate an endpoint after `N` consecutive dead
+deliveries (its `auto_disabled_at` is then set); unset means never.
+
+## Payment links
+
+- `PATCH  /v1/wallets/{id}/payment-links/{link_id}` — edit `description`, `redirect_url` and
+  `amount_usdc_stroops` (omit to keep, `null` to clear). Allowed only while no payment is
+  pending or has landed; otherwise `409`. Edits are audit-logged.
 
 ## API keys
 

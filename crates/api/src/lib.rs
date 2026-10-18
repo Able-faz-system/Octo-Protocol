@@ -159,6 +159,14 @@ pub fn build_router(state: AppState) -> Router {
             delete(routes::webhooks::delete_webhook),
         )
         .route(
+            "/v1/wallets/:id/webhooks/:endpoint_id/test",
+            post(routes::webhooks::test_webhook),
+        )
+        .route(
+            "/v1/wallets/:id/webhooks/:endpoint_id/deliveries/:delivery_id/redeliver",
+            post(routes::webhooks::redeliver_webhook),
+        )
+        .route(
             "/v1/wallets/:id/api-key",
             post(routes::apikeys::generate_key)
                 .get(routes::apikeys::get_key)
@@ -224,7 +232,8 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/wallets/:id/payment-links/:link_id",
             get(routes::payment_links::get_payment_link)
-                .put(routes::payment_links::set_payment_link_active),
+                .put(routes::payment_links::set_payment_link_active)
+                .patch(routes::payment_links::update_payment_link),
         )
         .route(
             "/v1/wallets/:id/payment-links/:link_id/payments",

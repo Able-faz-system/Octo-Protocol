@@ -28,6 +28,8 @@ pub struct WebhookView {
     pub active: bool,
     pub recent_failure_count: i64,
     pub last_successful_delivery_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Set when the endpoint was deactivated after too many consecutive dead deliveries.
+    pub auto_disabled_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// `POST /v1/wallets/:id/webhooks`
@@ -76,6 +78,7 @@ pub async fn create_webhook(
         active: ep.active,
         recent_failure_count: 0,
         last_successful_delivery_at: None,
+        auto_disabled_at: ep.auto_disabled_at,
     };
     let (status, json) = Envelope::created(view);
     Ok((status, json))
@@ -108,7 +111,12 @@ mod tests {
 pub struct DeliveriesQuery {
     /// Maximum rows to return (default 50, max 200).
     pub limit: Option<i64>,
+    /// Only deliveries with this status, e.g. `dead` for the dead-letter queue.
+    pub status: Option<String>,
 }
+
+/// Statuses a delivery-log row can hold (mirrors the `webhook_deliveries` CHECK constraint).
+const DELIVERY_STATUSES: &[&str] = &["pending", "delivered", "failed", "dead"];
 
 /// Generate a random hex secret for HMAC signing.
 fn generate_secret() -> String {
@@ -131,6 +139,163 @@ pub struct WebhookDeliveryView {
     pub response_body_snippet: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// The outcome of an owner-triggered send (test ping or redelivery).
+#[derive(Debug, Serialize)]
+pub struct DeliveryResultView {
+    /// Delivery-log row; it also appears in `GET .../deliveries`.
+    pub delivery_id: Option<Uuid>,
+    pub status: String,
+    pub delivered: bool,
+    pub attempts: i32,
+    pub response_code: Option<i32>,
+}
+
+impl From<octo_webhooks::DeliveryResult> for DeliveryResultView {
+    fn from(r: octo_webhooks::DeliveryResult) -> Self {
+        Self {
+            delivered: r.is_delivered(),
+            delivery_id: r.delivery_id,
+            status: r.status.to_string(),
+            attempts: r.attempts,
+            response_code: r.response_code,
+        }
+    }
+}
+
+/// Load an endpoint that belongs to `wallet_id` and is not soft-deleted; 404 otherwise.
+async fn owned_endpoint(
+    state: &AppState,
+    wallet_id: Uuid,
+    endpoint_id: Uuid,
+) -> ApiResult<octo_store::WebhookEndpoint> {
+    let endpoint = state.store().get_webhook_endpoint(endpoint_id).await?;
+    if endpoint.wallet_id != wallet_id || endpoint.deleted_at.is_some() {
+        return Err(ApiError::NotFound);
+    }
+    Ok(endpoint)
+}
+
+/// Throttle owner-triggered sends per endpoint.
+fn check_send_rate_limit(
+    state: &AppState,
+    endpoint_id: Uuid,
+    class: &'static str,
+    limit: u32,
+    window: std::time::Duration,
+) -> ApiResult<()> {
+    if state
+        .rate_limiter()
+        .check(&endpoint_id.to_string(), class, limit, window)
+    {
+        Ok(())
+    } else {
+        Err(ApiError::TooManyRequests(
+            "too many requests — slow down and try again shortly".into(),
+        ))
+    }
+}
+
+/// Audit an owner-triggered send against the wallet's owning user, if it has one.
+async fn audit_send(
+    state: &AppState,
+    wallet_id: Uuid,
+    action: &str,
+    target: Uuid,
+    headers: &HeaderMap,
+) {
+    if let Ok(wallet) = state.store().get_wallet(wallet_id).await {
+        if let Some(uid) = wallet.user_id {
+            crate::audit::record(
+                state,
+                uid,
+                action,
+                crate::audit::category::WEBHOOK,
+                Some(&target.to_string()),
+                headers,
+            )
+            .await;
+        }
+    }
+}
+
+/// `POST /v1/wallets/:id/webhooks/:endpoint_id/test` — send a signed `ping` event (#456).
+///
+/// Uses the same SSRF check and signing as real events, is recorded in the delivery history,
+/// and returns the result. Works on an auto-disabled endpoint so a fixed receiver can be checked.
+pub async fn test_webhook(
+    State(state): State<AppState>,
+    Path((wallet_id, endpoint_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Envelope<DeliveryResultView>>> {
+    authorize_wallet(&headers, &state, wallet_id).await?;
+    let endpoint = owned_endpoint(&state, wallet_id, endpoint_id).await?;
+    check_send_rate_limit(
+        &state,
+        endpoint_id,
+        "webhook_test",
+        crate::rate_limit::WEBHOOK_TEST_LIMIT,
+        crate::rate_limit::WEBHOOK_TEST_WINDOW,
+    )?;
+
+    let result = state.webhooks().send_ping(&endpoint).await;
+    audit_send(
+        &state,
+        wallet_id,
+        "sent a webhook test ping",
+        endpoint_id,
+        &headers,
+    )
+    .await;
+    Ok(Envelope::ok(result.into()))
+}
+
+/// `POST /v1/wallets/:id/webhooks/:endpoint_id/deliveries/:delivery_id/redeliver` (#457).
+///
+/// Re-sends a past event with its original data and a fresh signature. Ownership is checked
+/// down the chain (wallet → endpoint → delivery), the endpoint must still be active, and the
+/// call is rate limited and audit-logged.
+pub async fn redeliver_webhook(
+    State(state): State<AppState>,
+    Path((wallet_id, endpoint_id, delivery_id)): Path<(Uuid, Uuid, Uuid)>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Envelope<DeliveryResultView>>> {
+    authorize_wallet(&headers, &state, wallet_id).await?;
+    let endpoint = owned_endpoint(&state, wallet_id, endpoint_id).await?;
+    let original = state
+        .store()
+        .get_webhook_delivery(endpoint_id, delivery_id)
+        .await?;
+    if !endpoint.active {
+        return Err(ApiError::ConflictWith(
+            "endpoint is inactive; fix the receiver and send a test ping first".into(),
+        ));
+    }
+    // Pings are diagnostics, not events — re-sending one is never useful.
+    if original.event_type == octo_webhooks::PING_EVENT {
+        return Err(ApiError::BadRequest(
+            "test pings cannot be redelivered".into(),
+        ));
+    }
+    check_send_rate_limit(
+        &state,
+        endpoint_id,
+        "webhook_redeliver",
+        crate::rate_limit::WEBHOOK_REDELIVER_LIMIT,
+        crate::rate_limit::WEBHOOK_REDELIVER_WINDOW,
+    )?;
+
+    let result = state.webhooks().redeliver(&endpoint, &original).await;
+    audit_send(
+        &state,
+        wallet_id,
+        "redelivered a webhook event",
+        delivery_id,
+        &headers,
+    )
+    .await;
+    Ok(Envelope::ok(result.into()))
 }
 
 /// `DELETE /v1/wallets/:id/webhooks/:endpoint_id` — soft-delete an endpoint.
@@ -194,6 +359,7 @@ pub async fn list_webhooks(
                 active: ep.active,
                 recent_failure_count: health.recent_failure_count,
                 last_successful_delivery_at: health.last_successful_delivery_at,
+                auto_disabled_at: ep.auto_disabled_at,
             }
         })
         .collect();
@@ -229,10 +395,26 @@ pub async fn list_deliveries(
     }
 
     // Honour the validated `?limit=` (previously ignored in favour of a hardcoded 50).
-    let deliveries = state
-        .store()
-        .list_webhook_deliveries(endpoint_id, limit)
-        .await?;
+    let deliveries = match q.status.as_deref() {
+        Some(s) if DELIVERY_STATUSES.contains(&s) => {
+            state
+                .store()
+                .list_webhook_deliveries_with_status(endpoint_id, s, limit)
+                .await?
+        }
+        Some(_) => {
+            return Err(ApiError::BadRequest(format!(
+                "status must be one of: {}",
+                DELIVERY_STATUSES.join(", ")
+            )))
+        }
+        None => {
+            state
+                .store()
+                .list_webhook_deliveries(endpoint_id, limit)
+                .await?
+        }
+    };
 
     let views: Vec<WebhookDeliveryView> = deliveries
         .into_iter()

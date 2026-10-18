@@ -60,6 +60,13 @@ pub async fn create_payment_link(
         .name
         .filter(|n| !n.is_empty())
         .ok_or_else(|| ApiError::BadRequest("name is required".into()))?;
+    // Same checks as PATCH: the redirect is served to payers on the public pay page.
+    if let Some(url) = req.redirect_url.as_deref() {
+        validate_redirect_url(url)?;
+    }
+    if let Some(amount) = req.amount_usdc_stroops {
+        validate_link_amount(amount)?;
+    }
 
     let wallet = state.store().get_wallet(wallet_id).await?;
     let base = wallet.stellar_account_g.clone();
@@ -302,6 +309,107 @@ pub async fn set_payment_link_active(
         created_at: link.created_at,
         url,
     }))
+}
+
+/// Editable fields of an unpaid link. Omit a field to keep it; send `null` to clear it.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdatePaymentLinkRequest {
+    #[serde(default, deserialize_with = "crate::json::double_option::deserialize")]
+    pub description: Option<Option<String>>,
+    #[serde(default, deserialize_with = "crate::json::double_option::deserialize")]
+    pub redirect_url: Option<Option<String>>,
+    #[serde(default, deserialize_with = "crate::json::double_option::deserialize")]
+    pub amount_usdc_stroops: Option<Option<i64>>,
+}
+
+/// `PATCH /v1/wallets/:id/payment-links/:link_id` — edit an unpaid link (#455).
+///
+/// Only `description`, `redirect_url` and `amount_usdc_stroops` are editable; slug and name are
+/// not (unknown fields are rejected). Once any payment is pending or has landed the link is
+/// immutable and this returns 409. Edits are audit-logged.
+pub async fn update_payment_link(
+    State(state): State<AppState>,
+    Path((wallet_id, link_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Json<Envelope<PaymentLinkView>>> {
+    authorize_wallet(&headers, &state, wallet_id).await?;
+    let req: UpdatePaymentLinkRequest = parse_optional(&body)?;
+    if req.description.is_none() && req.redirect_url.is_none() && req.amount_usdc_stroops.is_none()
+    {
+        return Err(ApiError::BadRequest(
+            "provide at least one of description, redirect_url, amount_usdc_stroops".into(),
+        ));
+    }
+
+    // An empty string clears a text field, like `null`.
+    let description = req.description.map(|d| d.filter(|s| !s.trim().is_empty()));
+    let redirect_url = req.redirect_url.map(|u| u.filter(|s| !s.is_empty()));
+    if let Some(Some(url)) = redirect_url.as_ref() {
+        validate_redirect_url(url)?;
+    }
+    if let Some(Some(amount)) = req.amount_usdc_stroops {
+        validate_link_amount(amount)?;
+    }
+
+    let link = state
+        .store()
+        .update_unpaid_payment_link(
+            wallet_id,
+            link_id,
+            octo_store::PaymentLinkUpdate {
+                description: description.as_ref().map(|d| d.as_deref()),
+                redirect_url: redirect_url.as_ref().map(|u| u.as_deref()),
+                amount_usdc_stroops: req.amount_usdc_stroops,
+            },
+        )
+        .await
+        .map_err(|e| match e {
+            octo_store::StoreError::Conflict => ApiError::ConflictWith(
+                "payment link has a pending or completed payment and can no longer be edited"
+                    .into(),
+            ),
+            other => other.into(),
+        })?;
+
+    if let Some(uid) = state.store().get_wallet(wallet_id).await?.user_id {
+        crate::audit::record(
+            &state,
+            uid,
+            "edited a payment link",
+            crate::audit::category::PAYMENT_LINK,
+            Some(&link.id.to_string()),
+            &headers,
+        )
+        .await;
+    }
+
+    let collected = state.store().sum_payment_link_collected(link.id).await?;
+    let url = checkout_url(&state, &link.slug);
+    Ok(Envelope::ok(PaymentLinkView {
+        id: link.id,
+        slug: link.slug,
+        name: link.name,
+        description: link.description,
+        image_url: link.image_url,
+        redirect_url: link.redirect_url,
+        amount_usdc_stroops: link.amount_usdc_stroops,
+        active: link.active,
+        collected_usdc_stroops: collected,
+        created_at: link.created_at,
+        url,
+    }))
+}
+
+/// A link's fixed amount must be positive and within the per-intent cap.
+fn validate_link_amount(amount: i64) -> Result<(), ApiError> {
+    if amount <= 0 || amount > MAX_PAYMENT_INTENT_AMOUNT {
+        return Err(ApiError::BadRequest(format!(
+            "amount_usdc_stroops must be between 1 and {MAX_PAYMENT_INTENT_AMOUNT}"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
