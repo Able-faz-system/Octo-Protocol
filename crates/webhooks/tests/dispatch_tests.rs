@@ -135,7 +135,7 @@ async fn dispatch_does_not_retry_a_4xx_response() {
     assert_eq!(h.sender.dispatch(h.wallet_id, &event()).await, 0);
     assert_eq!(h.hits.load(Ordering::SeqCst), 1);
     let d = only_delivery(&h).await;
-    assert_eq!(d.status, "failed");
+    assert_eq!(d.status, "dead");
     assert_eq!(d.attempts, 1);
     assert_eq!(d.response_code, Some(400));
 }
@@ -149,7 +149,7 @@ async fn dispatch_gives_up_after_the_configured_attempt_count_and_logs_failure()
     assert_eq!(h.sender.dispatch(h.wallet_id, &event()).await, 0);
     assert_eq!(h.hits.load(Ordering::SeqCst), 3);
     let d = only_delivery(&h).await;
-    assert_eq!(d.status, "failed");
+    assert_eq!(d.status, "dead");
     assert_eq!(d.attempts, 3);
 }
 
@@ -163,7 +163,7 @@ async fn dispatch_records_the_response_status_on_failure() {
     };
     h.sender.dispatch(h.wallet_id, &event()).await;
     let d = only_delivery(&h).await;
-    assert_eq!(d.status, "failed");
+    assert_eq!(d.status, "dead");
     assert_eq!(d.response_code, Some(422));
     assert_eq!(d.response_body_snippet.as_deref(), Some("missing field `id`"));
 }
@@ -192,4 +192,99 @@ async fn dispatch_never_stores_an_echoed_secret_in_the_snippet() {
     h.sender.dispatch(h.wallet_id, &event()).await;
     let snippet = only_delivery(&h).await.response_body_snippet.unwrap();
     assert!(!snippet.contains("dispatch-secret"));
+}
+
+#[tokio::test]
+async fn ping_makes_one_attempt_and_is_recorded_as_failed_not_dead() {
+    let Some(h) = harness(vec![(StatusCode::INTERNAL_SERVER_ERROR, "down".into())]).await else {
+        eprintln!("SKIPPED: set DATABASE_URL");
+        return;
+    };
+    let ep = h.store.get_webhook_endpoint(h.endpoint_id).await.unwrap();
+    let result = h.sender.send_ping(&ep).await;
+    assert_eq!(result.status, "failed");
+    assert_eq!(result.attempts, 1);
+    assert_eq!(h.hits.load(Ordering::SeqCst), 1);
+    let d = only_delivery(&h).await;
+    assert_eq!(Some(d.id), result.delivery_id);
+    assert_eq!(d.event_type, "ping");
+    // A failing ping must never count toward auto-disable.
+    let ep = h.store.get_webhook_endpoint(h.endpoint_id).await.unwrap();
+    assert_eq!(ep.consecutive_dead_deliveries, 0);
+}
+
+#[tokio::test]
+async fn redeliver_reuses_the_original_data_with_a_new_body() {
+    let Some(h) = harness(vec![
+        (StatusCode::BAD_REQUEST, "nope".into()),
+        (StatusCode::OK, "ok".into()),
+    ])
+    .await
+    else {
+        eprintln!("SKIPPED: set DATABASE_URL");
+        return;
+    };
+    h.sender.dispatch(h.wallet_id, &event()).await;
+    let original = only_delivery(&h).await;
+    assert_eq!(original.status, "dead");
+
+    let ep = h.store.get_webhook_endpoint(h.endpoint_id).await.unwrap();
+    let result = h.sender.redeliver(&ep, &original).await;
+    assert!(result.is_delivered());
+
+    let replay = h
+        .store
+        .get_webhook_delivery(h.endpoint_id, result.delivery_id.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(replay.event_type, original.event_type);
+    assert_eq!(replay.payload["data"], original.payload["data"]);
+    assert_eq!(
+        replay.payload["redelivery_of"],
+        serde_json::json!(original.id)
+    );
+    assert_ne!(replay.payload, original.payload);
+}
+
+#[tokio::test]
+async fn endpoint_is_auto_disabled_after_the_configured_dead_streak() {
+    let Some(h) = harness(vec![(StatusCode::BAD_REQUEST, "nope".into())]).await else {
+        eprintln!("SKIPPED: set DATABASE_URL");
+        return;
+    };
+    let sender = h.sender.clone().with_auto_disable_after(Some(2));
+
+    sender.dispatch(h.wallet_id, &event()).await;
+    let ep = h.store.get_webhook_endpoint(h.endpoint_id).await.unwrap();
+    assert!(ep.active && ep.auto_disabled_at.is_none());
+
+    sender.dispatch(h.wallet_id, &event()).await;
+    let ep = h.store.get_webhook_endpoint(h.endpoint_id).await.unwrap();
+    assert!(!ep.active);
+    assert!(ep.auto_disabled_at.is_some());
+    assert_eq!(ep.consecutive_dead_deliveries, 2);
+
+    let dead = h
+        .store
+        .list_webhook_deliveries_with_status(h.endpoint_id, "dead", 10)
+        .await
+        .unwrap();
+    assert_eq!(dead.len(), 2);
+}
+
+#[tokio::test]
+async fn a_successful_delivery_resets_the_dead_streak() {
+    let Some(h) = harness(vec![
+        (StatusCode::BAD_REQUEST, "nope".into()),
+        (StatusCode::OK, "ok".into()),
+    ])
+    .await
+    else {
+        eprintln!("SKIPPED: set DATABASE_URL");
+        return;
+    };
+    h.sender.dispatch(h.wallet_id, &event()).await;
+    h.sender.dispatch(h.wallet_id, &event()).await;
+    let ep = h.store.get_webhook_endpoint(h.endpoint_id).await.unwrap();
+    assert_eq!(ep.consecutive_dead_deliveries, 0);
 }

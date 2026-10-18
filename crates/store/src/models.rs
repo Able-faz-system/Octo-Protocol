@@ -135,6 +135,10 @@ pub struct WebhookEndpoint {
     pub active: bool,
     pub created_at: DateTime<Utc>,
     pub deleted_at: Option<DateTime<Utc>>,
+    /// Dead deliveries in a row; any successful delivery resets it to 0.
+    pub consecutive_dead_deliveries: i32,
+    /// Set when the endpoint was deactivated for hitting the dead-delivery threshold.
+    pub auto_disabled_at: Option<DateTime<Utc>>,
 }
 
 /// A single webhook delivery attempt (append-only log).
@@ -306,6 +310,14 @@ pub struct NewPaymentLink<'a> {
     pub image_url: Option<&'a str>,
     pub redirect_url: Option<&'a str>,
     pub amount_usdc_stroops: Option<i64>,
+}
+
+/// Owner edits to a payment link. Outer `None` leaves a field unchanged; `Some(None)` clears it.
+#[derive(Debug, Clone, Default)]
+pub struct PaymentLinkUpdate<'a> {
+    pub description: Option<Option<&'a str>>,
+    pub redirect_url: Option<Option<&'a str>>,
+    pub amount_usdc_stroops: Option<Option<i64>>,
 }
 
 /// One payment attempt against a payment link.

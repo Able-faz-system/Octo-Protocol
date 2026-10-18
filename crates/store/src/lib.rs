@@ -20,9 +20,9 @@ pub use config::{StoreConfig, StoreConfigError};
 pub use error::StoreError;
 pub use models::{
     Address, ApiKey, AuditLog, DenylistedToken, EmailOtp, GasSponsorshipConfig, NewDeposit,
-    NewPaymentLink, NewSponsoredTx, PaymentLink, PaymentLinkPayment, SponsoredTransaction,
-    Transaction, User, Wallet, WebhookDelivery, WebhookEndpoint, WhitelistedAddress, Withdrawal,
-    WithdrawalAllowlistConfig,
+    NewPaymentLink, NewSponsoredTx, PaymentLink, PaymentLinkPayment, PaymentLinkUpdate,
+    SponsoredTransaction, Transaction, User, Wallet, WebhookDelivery, WebhookEndpoint,
+    WhitelistedAddress, Withdrawal, WithdrawalAllowlistConfig,
 };
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -1558,6 +1558,55 @@ impl Store {
         .ok_or(StoreError::NotFound)
     }
 
+    /// Apply owner edits to a payment link that has not been paid (#455).
+    ///
+    /// A link is locked once any payment against it is in flight or has landed (`pending`,
+    /// `confirmed`, `underpaid`, `overpaid`): a payer was quoted the current terms. The check runs
+    /// inside the UPDATE so a payment confirming concurrently can't slip between check and write.
+    /// Returns `NotFound` for a missing or foreign link and `Conflict` for a locked one.
+    pub async fn update_unpaid_payment_link(
+        &self,
+        wallet_id: Uuid,
+        id: Uuid,
+        update: PaymentLinkUpdate<'_>,
+    ) -> Result<PaymentLink, StoreError> {
+        let updated = sqlx::query_as::<_, PaymentLink>(
+            r#"
+            UPDATE payment_links SET
+                description = CASE WHEN $3 THEN $4 ELSE description END,
+                redirect_url = CASE WHEN $5 THEN $6 ELSE redirect_url END,
+                amount_usdc_stroops = CASE WHEN $7 THEN $8 ELSE amount_usdc_stroops END,
+                updated_at = now()
+            WHERE id = $1 AND wallet_id = $2
+              AND NOT EXISTS (
+                  SELECT 1 FROM payment_link_payments p
+                  WHERE p.payment_link_id = payment_links.id
+                    AND p.status IN ('pending', 'confirmed', 'underpaid', 'overpaid')
+              )
+            RETURNING *
+            "#,
+        )
+        .bind(id)
+        .bind(wallet_id)
+        .bind(update.description.is_some())
+        .bind(update.description.flatten())
+        .bind(update.redirect_url.is_some())
+        .bind(update.redirect_url.flatten())
+        .bind(update.amount_usdc_stroops.is_some())
+        .bind(update.amount_usdc_stroops.flatten())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match updated {
+            Some(link) => Ok(link),
+            // No row: either it isn't this wallet's link, or it exists but is locked.
+            None => {
+                self.get_payment_link(wallet_id, id).await?;
+                Err(StoreError::Conflict)
+            }
+        }
+    }
+
     /// Record a payer's intent to pay (the "Continue" step, before any on-chain payment lands).
     pub async fn record_payment_link_intent(
         &self,
@@ -2132,6 +2181,89 @@ impl Store {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+
+    /// An endpoint's delivery history filtered to one `status` (e.g. `dead`), newest first.
+    pub async fn list_webhook_deliveries_with_status(
+        &self,
+        endpoint_id: Uuid,
+        status: &str,
+        limit: i64,
+    ) -> Result<Vec<WebhookDelivery>, StoreError> {
+        let rows = sqlx::query_as::<_, WebhookDelivery>(
+            r#"
+            SELECT * FROM webhook_deliveries
+            WHERE endpoint_id = $1 AND status = $2
+            ORDER BY created_at DESC, id DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(endpoint_id)
+        .bind(status)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Fetch one delivery scoped to its endpoint, so a delivery id can't be used across endpoints.
+    pub async fn get_webhook_delivery(
+        &self,
+        endpoint_id: Uuid,
+        id: Uuid,
+    ) -> Result<WebhookDelivery, StoreError> {
+        sqlx::query_as::<_, WebhookDelivery>(
+            "SELECT * FROM webhook_deliveries WHERE id = $1 AND endpoint_id = $2",
+        )
+        .bind(id)
+        .bind(endpoint_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)
+    }
+
+    /// Track an endpoint's dead-delivery streak and deactivate it at `auto_disable_after` (#458).
+    ///
+    /// A delivered event resets the streak. Returns true only on the call that disabled it.
+    pub async fn record_webhook_endpoint_outcome(
+        &self,
+        endpoint_id: Uuid,
+        dead: bool,
+        auto_disable_after: Option<i32>,
+    ) -> Result<bool, StoreError> {
+        if !dead {
+            sqlx::query(
+                "UPDATE webhook_endpoints SET consecutive_dead_deliveries = 0 \
+                 WHERE id = $1 AND consecutive_dead_deliveries <> 0",
+            )
+            .bind(endpoint_id)
+            .execute(&self.pool)
+            .await?;
+            return Ok(false);
+        }
+
+        // SET expressions read pre-update values, so `consecutive_dead_deliveries + 1` is the new streak.
+        let disabled: Option<bool> = sqlx::query_scalar(
+            r#"
+            WITH hit AS (
+                SELECT id, active AS was_active,
+                       ($2::int IS NOT NULL AND consecutive_dead_deliveries + 1 >= $2) AS trips
+                FROM webhook_endpoints WHERE id = $1 FOR UPDATE
+            )
+            UPDATE webhook_endpoints e SET
+                consecutive_dead_deliveries = e.consecutive_dead_deliveries + 1,
+                active = CASE WHEN hit.trips THEN false ELSE e.active END,
+                auto_disabled_at = CASE WHEN hit.trips AND hit.was_active THEN now()
+                                        ELSE e.auto_disabled_at END
+            FROM hit WHERE e.id = hit.id
+            RETURNING (hit.trips AND hit.was_active)
+            "#,
+        )
+        .bind(endpoint_id)
+        .bind(auto_disable_after)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(disabled.unwrap_or(false))
     }
 
     /// Record a webhook delivery attempt (audit log). Returns the delivery id.

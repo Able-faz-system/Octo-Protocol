@@ -33,6 +33,11 @@ pub const PAY_STATUS_LIMIT: u32 = 60;
 pub const PAY_STATUS_WINDOW: Duration = Duration::from_secs(60);
 pub const PAY_SIGNING_INFO_LIMIT: u32 = 60;
 pub const PAY_SIGNING_INFO_WINDOW: Duration = Duration::from_secs(60);
+// Owner-triggered outbound webhook sends, keyed per endpoint so one key can't flood a receiver.
+pub const WEBHOOK_TEST_LIMIT: u32 = 5;
+pub const WEBHOOK_TEST_WINDOW: Duration = Duration::from_secs(60);
+pub const WEBHOOK_REDELIVER_LIMIT: u32 = 10;
+pub const WEBHOOK_REDELIVER_WINDOW: Duration = Duration::from_secs(60);
 pub const PAY_SUBMIT_LIMIT: u32 = 20;
 pub const PAY_SUBMIT_WINDOW: Duration = Duration::from_secs(60);
 // Seed-backup retrieval: legitimate use is a rare new-device recovery, so keep this tight.

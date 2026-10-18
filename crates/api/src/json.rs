@@ -19,6 +19,22 @@ where
     serde_json::from_slice::<T>(bytes).map_err(|_| ApiError::BadRequest("invalid JSON body".into()))
 }
 
+/// PATCH-field deserializer: absent → `None`, `null` → `Some(None)`, value → `Some(Some(v))`.
+///
+/// Pair with `#[serde(default, deserialize_with = "crate::json::double_option::deserialize")]`
+/// so a client can tell "leave unchanged" (omit the field) apart from "clear it" (send `null`).
+pub mod double_option {
+    use serde::{Deserialize, Deserializer};
+
+    pub fn deserialize<'de, T, D>(d: D) -> Result<Option<Option<T>>, D::Error>
+    where
+        T: Deserialize<'de>,
+        D: Deserializer<'de>,
+    {
+        Option::<T>::deserialize(d).map(Some)
+    }
+}
+
 /// Serialize an `i64` as a JSON **string**.
 ///
 /// For values that can exceed JavaScript's `Number.MAX_SAFE_INTEGER` (9,007,199,254,740,991),

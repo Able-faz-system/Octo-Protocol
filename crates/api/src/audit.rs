@@ -16,6 +16,7 @@ pub mod category {
     pub const ADDRESS: &str = "address";
     pub const CREDENTIALS: &str = "credentials";
     pub const WEBHOOK: &str = "configuration";
+    pub const PAYMENT_LINK: &str = "configuration";
     pub const WITHDRAWAL: &str = "wallet";
     pub const SPONSORSHIP: &str = "sponsorship";
 

@@ -67,6 +67,46 @@ impl Retriable for AttemptOutcome {
     }
 }
 
+/// Delivery-log statuses written by the sender.
+pub mod status {
+    pub const DELIVERED: &str = "delivered";
+    /// Never attempted (unsafe URL) or a diagnostic ping that failed.
+    pub const FAILED: &str = "failed";
+    /// Terminal: retries exhausted or a non-retriable answer (#458).
+    pub const DEAD: &str = "dead";
+}
+
+/// Event type of the diagnostic ping sent by [`WebhookSender::send_ping`].
+pub const PING_EVENT: &str = "ping";
+
+/// Env var holding the dead-delivery streak that auto-disables an endpoint (unset = never).
+pub const AUTO_DISABLE_ENV: &str = "OCTO_WEBHOOK_AUTO_DISABLE_AFTER";
+
+/// The final, logged result of sending one event to one endpoint.
+#[derive(Debug, Clone)]
+pub struct DeliveryResult {
+    /// Delivery-log row id; `None` only if writing the log row itself failed.
+    pub delivery_id: Option<Uuid>,
+    pub status: &'static str,
+    pub attempts: i32,
+    pub response_code: Option<i32>,
+}
+
+impl DeliveryResult {
+    pub fn is_delivered(&self) -> bool {
+        self.status == status::DELIVERED
+    }
+}
+
+/// How a send is retried, labelled on failure, and whether it feeds the auto-disable streak.
+#[derive(Clone, Copy)]
+enum SendKind {
+    /// A real event: full retry policy, `dead` on failure, counts toward auto-disable.
+    Event,
+    /// A diagnostic ping: one attempt, `failed` on failure, never disables the endpoint.
+    Ping,
+}
+
 /// Sends signed webhooks for a wallet's active endpoints, with retry + delivery logging.
 #[derive(Clone)]
 pub struct WebhookSender {
@@ -74,6 +114,7 @@ pub struct WebhookSender {
     http: reqwest::Client,
     retry_policy: RetryPolicy,
     delivery_timeout: Duration,
+    auto_disable_after: Option<i32>,
 }
 
 impl WebhookSender {
@@ -87,7 +128,14 @@ impl WebhookSender {
                 .unwrap_or_default(),
             retry_policy: default_retry_policy(),
             delivery_timeout: DEFAULT_DELIVERY_TIMEOUT,
+            auto_disable_after: auto_disable_after_from_env(),
         }
+    }
+
+    /// Deactivate an endpoint after `n` consecutive dead deliveries (`None` disables the feature).
+    pub fn with_auto_disable_after(mut self, n: Option<i32>) -> Self {
+        self.auto_disable_after = n.filter(|n| *n > 0);
+        self
     }
 
     /// Set a custom total delivery timeout ceiling per endpoint, across all retries (default 20s).
@@ -118,34 +166,94 @@ impl WebhookSender {
             "event": event.event_type,
             "data": event.data,
         });
-        let body_bytes = serde_json::to_vec(&body).unwrap_or_default();
 
         let mut delivered = 0;
         for ep in endpoints {
-            if !is_safe_url(&ep.url) {
-                tracing::warn!(url = %ep.url, "skipping webhook to unsafe URL");
-                let _ = self
-                    .store
-                    .log_webhook_delivery(
-                        ep.id,
-                        &event.event_type,
-                        &body,
-                        "failed",
-                        0,
-                        None,
-                        None,
-                    )
-                    .await;
-                continue;
-            }
-            if self
-                .deliver_with_retry(&ep, &event.event_type, &body, &body_bytes)
-                .await
-            {
+            let result = self
+                .send(&ep, &event.event_type, &body, SendKind::Event)
+                .await;
+            if result.is_delivered() {
                 delivered += 1;
             }
         }
         delivered
+    }
+
+    /// Send a signed `ping` to one endpoint so its owner can verify their receiver (#456).
+    ///
+    /// Goes through the same SSRF check, signing and delivery log as real events, but makes a
+    /// single attempt and never counts toward auto-disable. Callers enforce ownership.
+    pub async fn send_ping(&self, ep: &octo_store::WebhookEndpoint) -> DeliveryResult {
+        let body = json!({
+            "event": PING_EVENT,
+            "data": { "endpoint_id": ep.id, "sent_at": unix_now() },
+        });
+        self.send(ep, PING_EVENT, &body, SendKind::Ping).await
+    }
+
+    /// Re-send a past delivery's event to its endpoint (#457). Callers enforce ownership.
+    ///
+    /// The original `event` and `data` are reused verbatim; `redelivery_of` and a fresh
+    /// `redelivered_at` are added so the body, and therefore the signature, is new.
+    pub async fn redeliver(
+        &self,
+        ep: &octo_store::WebhookEndpoint,
+        original: &octo_store::WebhookDelivery,
+    ) -> DeliveryResult {
+        let body = json!({
+            "event": original.event_type,
+            "data": original.payload.get("data").cloned().unwrap_or(serde_json::Value::Null),
+            "redelivery_of": original.id,
+            "redelivered_at": unix_now(),
+        });
+        self.send(ep, &original.event_type, &body, SendKind::Event)
+            .await
+    }
+
+    /// SSRF-check, sign and deliver `body` to one endpoint, logging the outcome.
+    async fn send(
+        &self,
+        ep: &octo_store::WebhookEndpoint,
+        event_type: &str,
+        body: &serde_json::Value,
+        kind: SendKind,
+    ) -> DeliveryResult {
+        if !is_safe_url(&ep.url) {
+            tracing::warn!(url = %ep.url, "skipping webhook to unsafe URL");
+            let delivery_id = self
+                .store
+                .log_webhook_delivery(ep.id, event_type, body, status::FAILED, 0, None, None)
+                .await
+                .ok();
+            return DeliveryResult {
+                delivery_id,
+                status: status::FAILED,
+                attempts: 0,
+                response_code: None,
+            };
+        }
+        let body_bytes = serde_json::to_vec(body).unwrap_or_default();
+        let result = self
+            .deliver_with_retry(ep, event_type, body, &body_bytes, kind)
+            .await;
+
+        if matches!(kind, SendKind::Event) {
+            let dead = !result.is_delivered();
+            match self
+                .store
+                .record_webhook_endpoint_outcome(ep.id, dead, self.auto_disable_after)
+                .await
+            {
+                Ok(true) => tracing::warn!(
+                    endpoint_id = %ep.id,
+                    threshold = ?self.auto_disable_after,
+                    "webhook endpoint auto-disabled after consecutive dead deliveries"
+                ),
+                Ok(false) => {}
+                Err(e) => tracing::warn!(error = ?e, "could not update endpoint delivery streak"),
+            }
+        }
+        result
     }
 
     /// Deliver to one endpoint via `octo_resilience::execute`, then log the final outcome.
@@ -155,7 +263,18 @@ impl WebhookSender {
         event_type: &str,
         body: &serde_json::Value,
         body_bytes: &[u8],
-    ) -> bool {
+        kind: SendKind,
+    ) -> DeliveryResult {
+        let (policy, failed_status) = match kind {
+            SendKind::Event => (self.retry_policy.clone(), status::DEAD),
+            SendKind::Ping => (
+                RetryPolicy {
+                    max_attempts: 1,
+                    ..self.retry_policy.clone()
+                },
+                status::FAILED,
+            ),
+        };
         let signature = sign::sign(ep.secret.as_bytes(), body_bytes);
         // Fresh per delivery and never tripping: one endpoint's outage must not gate another's.
         let circuit = CircuitBreaker::new(u32::MAX, Duration::ZERO);
@@ -167,7 +286,7 @@ impl WebhookSender {
 
         let result = tokio::time::timeout(
             self.delivery_timeout,
-            octo_resilience::execute(&circuit, &self.retry_policy, CallKind::ReadOnly, move || {
+            octo_resilience::execute(&circuit, &policy, CallKind::ReadOnly, move || {
                 attempts_ref.fetch_add(1, Ordering::Relaxed);
                 async move {
                     let outcome = self.attempt_once(ep, signature_ref, body_bytes).await;
@@ -182,16 +301,10 @@ impl WebhookSender {
         )
         .await;
 
-                    }
-                }
-            }),
-        )
-        .await;
-
-        let (status, outcome) = match result {
-            Ok(Ok(outcome)) => ("delivered", outcome),
-            Ok(Err(ResilienceError::Exhausted(outcome))) => ("failed", outcome),
-            Ok(Err(ResilienceError::Circuit)) => ("failed", take_last(&last)),
+        let (final_status, outcome) = match result {
+            Ok(Ok(outcome)) => (status::DELIVERED, outcome),
+            Ok(Err(ResilienceError::Exhausted(outcome))) => (failed_status, outcome),
+            Ok(Err(ResilienceError::Circuit)) => (failed_status, take_last(&last)),
             Err(_) => {
                 tracing::warn!(
                     endpoint_id = %ep.id,
@@ -199,23 +312,32 @@ impl WebhookSender {
                     timeout_secs = self.delivery_timeout.as_secs(),
                     "webhook delivery exceeded overall deadline"
                 );
-                ("failed", take_last(&last))
+                (failed_status, take_last(&last))
             }
         };
 
-        let _ = self
+        let attempts = attempts.load(Ordering::Relaxed).max(1) as i32;
+        let response_code = outcome.status.map(i32::from);
+        let delivery_id = self
             .store
             .log_webhook_delivery(
                 ep.id,
                 event_type,
                 body,
-                status,
-                attempts.load(Ordering::Relaxed).max(1) as i32,
-                outcome.status.map(i32::from),
+                final_status,
+                attempts,
+                response_code,
                 outcome.body_snippet.as_deref(),
             )
-            .await;
-        status == "delivered"
+            .await
+            .map_err(|e| tracing::warn!(error = ?e, "could not log webhook delivery"))
+            .ok();
+        DeliveryResult {
+            delivery_id,
+            status: final_status,
+            attempts,
+            response_code,
+        }
     }
 
     /// One signed POST. Reads at most a bounded prefix of the response body.
@@ -292,6 +414,24 @@ async fn is_safe_delivery_url(url: &str) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// Seconds since the Unix epoch, for envelope timestamps.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+}
+
+/// Read [`AUTO_DISABLE_ENV`]; unset, unparsable or non-positive means auto-disable is off.
+fn auto_disable_after_from_env() -> Option<i32> {
+    parse_auto_disable_after(std::env::var(AUTO_DISABLE_ENV).ok().as_deref())
+}
+
+fn parse_auto_disable_after(raw: Option<&str>) -> Option<i32> {
+    raw.and_then(|v| v.trim().parse::<i32>().ok())
+        .filter(|n| *n > 0)
 }
 
 /// Take the last attempt's outcome, tolerating a poisoned lock (logging must still happen).
@@ -381,6 +521,10 @@ fn is_public_ipv4(ip: Ipv4Addr) -> bool {
 fn is_public_ipv6(ip: Ipv6Addr) -> bool {
     if let Some(v4) = ip.to_ipv4_mapped() {
         return is_public_ipv4(v4);
+    }
+    // Deprecated IPv4-compatible form (`::a.b.c.d`) is judged by its embedded IPv4 too.
+    if ip.segments()[..6].iter().all(|s| *s == 0) {
+        return ip.to_ipv4().is_some_and(is_public_ipv4);
     }
     let first = ip.segments()[0];
     !(ip.is_unspecified()
@@ -501,7 +645,19 @@ fn is_unsafe_ipv6(ip: std::net::Ipv6Addr) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_safe_url, response_snippet, RESPONSE_SNIPPET_MAX_BYTES};
+    use super::{
+        is_safe_url, parse_auto_disable_after, response_snippet, RESPONSE_SNIPPET_MAX_BYTES,
+    };
+
+    #[test]
+    fn auto_disable_threshold_parses_only_positive_integers() {
+        assert_eq!(parse_auto_disable_after(Some("5")), Some(5));
+        assert_eq!(parse_auto_disable_after(Some(" 3 ")), Some(3));
+        assert_eq!(parse_auto_disable_after(Some("0")), None);
+        assert_eq!(parse_auto_disable_after(Some("-2")), None);
+        assert_eq!(parse_auto_disable_after(Some("ten")), None);
+        assert_eq!(parse_auto_disable_after(None), None);
+    }
 
     // --- Standard Public URLs ---
     #[test]
