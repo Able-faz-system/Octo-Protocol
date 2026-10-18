@@ -155,6 +155,48 @@ impl Store {
         Ok(row)
     }
 
+    /// Return the active per-email authentication lock, if any.
+    pub async fn auth_locked_until(
+        &self,
+        email: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, StoreError> {
+        Ok(sqlx::query_scalar(
+            "SELECT locked_until FROM auth_lockouts WHERE email = lower($1) AND locked_until > now()",
+        )
+        .bind(email)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten())
+    }
+
+    /// Record a failed login. Five failures in fifteen minutes trigger an exponentially longer lock.
+    pub async fn record_auth_failure(&self, email: &str) -> Result<(), StoreError> {
+        sqlx::query(
+            r#"
+            INSERT INTO auth_lockouts (email, failed_attempts) VALUES (lower($1), 1)
+            ON CONFLICT (email) DO UPDATE SET
+                failed_attempts = CASE WHEN auth_lockouts.window_started < now() - interval '15 minutes' THEN 1 ELSE auth_lockouts.failed_attempts + 1 END,
+                window_started = CASE WHEN auth_lockouts.window_started < now() - interval '15 minutes' THEN now() ELSE auth_lockouts.window_started END,
+                lockout_count = CASE WHEN auth_lockouts.failed_attempts + 1 >= 5 THEN auth_lockouts.lockout_count + 1 ELSE auth_lockouts.lockout_count END,
+                locked_until = CASE WHEN auth_lockouts.failed_attempts + 1 >= 5 THEN now() + make_interval(secs => 60 * (1 << LEAST(auth_lockouts.lockout_count, 6))) ELSE auth_lockouts.locked_until END,
+                updated_at = now()
+            "#,
+        )
+        .bind(email)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Clear failed-attempt state after successful authentication or an administrative unlock.
+    pub async fn reset_auth_failures(&self, email: &str) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM auth_lockouts WHERE email = lower($1)")
+            .bind(email)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Mark a user's email as verified.
     pub async fn mark_email_verified(&self, user_id: Uuid) -> Result<(), StoreError> {
         sqlx::query("UPDATE users SET email_verified_at = now() WHERE id = $1")
@@ -854,6 +896,35 @@ impl Store {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+
+    /// Link a quarantined deposit to an address without ever replacing an existing attribution.
+    pub async fn attribute_quarantined_deposit(
+        &self,
+        transaction_id: Uuid,
+        address_id: Uuid,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE transactions SET address_id = $2 WHERE id = $1 AND address_id IS NULL",
+        )
+        .bind(transaction_id)
+        .bind(address_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Return only deposits awaiting attribution for a wallet, newest first.
+    pub async fn list_quarantined_transactions(
+        &self,
+        wallet_id: Uuid,
+    ) -> Result<Vec<Transaction>, StoreError> {
+        Ok(sqlx::query_as::<_, Transaction>(
+            "SELECT * FROM transactions WHERE wallet_id = $1 AND direction = 'deposit' AND address_id IS NULL ORDER BY created_at DESC, id DESC",
+        )
+        .bind(wallet_id)
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     /// Paginated version of [`list_transactions`]: returns at most `limit` rows, newest first.
