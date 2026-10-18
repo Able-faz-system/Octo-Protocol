@@ -1,8 +1,10 @@
 //! Audit logging helpers.
 //!
 //! Records notable account activity (sign-in, wallet/address/key creation, withdrawals). Auditing
-//! is best-effort: a failure here is logged but never blocks the primary operation.
+//! is best-effort ([`record`]) except for secret-adjacent reads, which use [`record_strict`] and
+//! refuse to proceed without an audit row.
 
+use crate::error::ApiError;
 use crate::state::AppState;
 use axum::http::HeaderMap;
 use uuid::Uuid;
@@ -16,6 +18,13 @@ pub mod category {
     pub const WEBHOOK: &str = "configuration";
     pub const WITHDRAWAL: &str = "wallet";
     pub const SPONSORSHIP: &str = "sponsorship";
+
+    pub const ALL: &[&str] = &[AUTH, WALLET, ADDRESS, CREDENTIALS, WEBHOOK, SPONSORSHIP];
+}
+
+/// Fixed action strings that tooling or alerting may match on exactly.
+pub mod action {
+    pub const BACKUP_RETRIEVED: &str = "retrieved encrypted seed backup";
 }
 
 /// Best-effort client IP from common proxy headers (first `X-Forwarded-For`, then `X-Real-IP`).
@@ -50,4 +59,27 @@ pub async fn record(
     {
         tracing::warn!(error = ?e, action, "failed to record audit log");
     }
+}
+
+/// Record an audit event, failing the caller if the row can't be written.
+///
+/// For operations that must never happen untraced (e.g. handing out the sealed seed backup).
+/// `action` and `target` must never carry key material — pass identifiers only.
+pub async fn record_strict(
+    state: &AppState,
+    user_id: Uuid,
+    action: &str,
+    category: &str,
+    target: Option<&str>,
+    headers: &HeaderMap,
+) -> Result<(), ApiError> {
+    let ip = client_ip(headers);
+    state
+        .store()
+        .record_audit(user_id, action, category, target, ip.as_deref())
+        .await
+        .map_err(|e| {
+            tracing::error!(error = ?e, action, "failed to record mandatory audit log");
+            ApiError::Internal
+        })
 }

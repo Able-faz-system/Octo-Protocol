@@ -1,6 +1,6 @@
 //! Gas sponsorship configuration: enable/disable sponsorship and set spend controls.
 
-use crate::auth::authorize_wallet;
+use crate::auth::{authorize_wallet, authorize_wallet_scope};
 use crate::error::{ApiError, ApiResult, Envelope};
 use crate::json::parse_optional;
 use crate::state::AppState;
@@ -62,15 +62,27 @@ pub async fn get_config(
     Ok(Envelope::ok(view))
 }
 
-/// `PUT /v1/wallets/:id/sponsorship`
+/// `PUT /v1/wallets/:id/sponsorship`; requires at least one field (see `docs/api.md`).
 pub async fn put_config(
     State(state): State<AppState>,
     Path(wallet_id): Path<Uuid>,
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Json<Envelope<SponsorshipConfigView>>> {
-    authorize_wallet(&headers, &state, wallet_id).await?;
+    authorize_wallet_scope(&headers, &state, wallet_id, "sponsor").await?;
+    let wallet = state.store().get_wallet(wallet_id).await?;
+    if wallet.is_archived() {
+        return Err(ApiError::Forbidden("wallet is archived".into()));
+    }
     let req: SponsorshipConfigRequest = parse_optional(&body)?;
+    if req.enabled.is_none()
+        && req.per_tx_fee_cap_stroops.is_none()
+        && req.daily_budget_stroops.is_none()
+    {
+        return Err(ApiError::BadRequest(
+            "at least one field must be provided".into(),
+        ));
+    }
 
     let enabled = req.enabled.unwrap_or(false);
     if let Some(cap) = req.per_tx_fee_cap_stroops {
@@ -85,6 +97,15 @@ pub async fn put_config(
             return Err(ApiError::BadRequest(
                 "daily_budget_stroops must be >= 0".into(),
             ));
+        }
+    }
+    // A per-tx cap above the daily budget can never be fully used; reject the contradiction.
+    if let (Some(cap), Some(budget)) = (req.per_tx_fee_cap_stroops, req.daily_budget_stroops) {
+        if cap > budget {
+            return Err(ApiError::BadRequest(format!(
+                "per_tx_fee_cap_stroops ({cap}) must not exceed daily_budget_stroops ({budget}); \
+                 lower the per-transaction cap or raise the daily budget"
+            )));
         }
     }
 

@@ -8,8 +8,8 @@
 //!
 //! - [`CircuitBreaker`]: after `failure_threshold` consecutive failures the circuit **opens**,
 //!   short-circuiting further calls with [`CircuitError::Open`] for `reset_timeout` seconds.
-//!   After the cool-down the circuit moves to **half-open**: the next call is attempted; success
-//!   closes it, failure re-opens it.
+//!   After the cool-down the circuit moves to **half-open**: exactly one probe call is attempted
+//!   (concurrent callers still see `Open`); success closes it, failure re-opens it.
 //!
 //! # Submit asymmetry — why submit_transaction is never retried
 //!
@@ -82,10 +82,21 @@ impl Default for RetryPolicy {
 
 impl RetryPolicy {
     /// Compute the delay before attempt number `attempt` (0-indexed: attempt 0 = first retry).
+    ///
+    /// Invariant: never panics and never exceeds `max_delay_ms`, whatever `attempt` is passed.
     pub fn delay_for(&self, attempt: u32) -> Duration {
         let base = self.base_delay_ms as f64;
-        let exp = base * self.multiplier.powi(attempt as i32);
-        let capped = exp.min(self.max_delay_ms as f64);
+        let max = self.max_delay_ms as f64;
+        // Saturate rather than wrap: `attempt as i32` turned huge attempts into negative powers.
+        let exponent = i32::try_from(attempt).unwrap_or(i32::MAX);
+        // A zero base stays zero instead of becoming 0 × ∞ = NaN once the power overflows.
+        let exp = if base == 0.0 {
+            0.0
+        } else {
+            base * self.multiplier.powi(exponent)
+        };
+        // Clamp before any further arithmetic; a NaN (bad multiplier) backs off fully.
+        let capped = if exp.is_nan() { max } else { exp.clamp(0.0, max) };
         // Simple pseudo-jitter: use the attempt index as a cheap entropy source.
         // In production this is fine — the goal is just to spread bursts out, not
         // to be cryptographically random.
@@ -95,7 +106,8 @@ impl RetryPolicy {
         } else {
             jitter_range * -0.5
         };
-        let ms = (capped + jitter).max(0.0) as u64;
+        // Jitter must not push past the documented upper bound either.
+        let ms = (capped + jitter).clamp(0.0, max) as u64;
         Duration::from_millis(ms)
     }
 }
@@ -108,7 +120,8 @@ impl RetryPolicy {
 enum CbState {
     Closed,
     Open { opened_at: Instant },
-    HalfOpen,
+    /// A single probe is in flight; it was claimed at `probe_started`.
+    HalfOpen { probe_started: Instant },
 }
 
 /// Shared, thread-safe circuit-breaker state.
@@ -162,19 +175,26 @@ impl CircuitBreaker {
 
     /// Check whether a call may proceed. Returns `Err(CircuitError::Open)` when the circuit is
     /// open and the cool-down has not elapsed yet.
+    ///
+    /// Single-probe guarantee: once the cool-down elapses, exactly one caller claims the probe
+    /// slot — the Open → HalfOpen transition and the claim happen under one lock. Every other
+    /// caller gets `CircuitError::Open` until that probe reports via `on_success`/`on_failure`.
+    /// A probe that never reports (cancelled future, non-retriable error) frees the slot after
+    /// another `reset_timeout`, so a lost probe cannot wedge the breaker half-open forever.
     pub fn check(&self) -> Result<(), CircuitError> {
         let mut inner = self.inner.lock().unwrap();
-        match &inner.state {
-            CbState::Closed | CbState::HalfOpen => Ok(()),
-            CbState::Open { opened_at } => {
-                if opened_at.elapsed() >= self.reset_timeout {
-                    // Cool-down has passed — allow a single probe attempt.
-                    inner.state = CbState::HalfOpen;
-                    Ok(())
-                } else {
-                    Err(CircuitError::Open)
-                }
-            }
+        let since = match inner.state {
+            CbState::Closed => return Ok(()),
+            CbState::Open { opened_at } => opened_at,
+            CbState::HalfOpen { probe_started } => probe_started,
+        };
+        if since.elapsed() >= self.reset_timeout {
+            inner.state = CbState::HalfOpen {
+                probe_started: Instant::now(),
+            };
+            Ok(())
+        } else {
+            Err(CircuitError::Open)
         }
     }
 
@@ -482,7 +502,9 @@ mod tests {
         // Manually force to half-open by pretending the timeout elapsed.
         {
             let mut inner = cb.inner.lock().unwrap();
-            inner.state = CbState::HalfOpen;
+            inner.state = CbState::HalfOpen {
+                probe_started: Instant::now(),
+            };
         }
         cb.on_success();
         assert!(cb.is_closed());

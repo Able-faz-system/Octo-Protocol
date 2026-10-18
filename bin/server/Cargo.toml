@@ -22,6 +22,7 @@ octo-email.workspace = true
 octo-wallet-core.workspace = true
 octo-resilience.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 tracing.workspace = true

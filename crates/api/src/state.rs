@@ -24,8 +24,8 @@ struct Inner {
     /// AES-256 master key used to seal/open seeds. Held zeroized.
     master_key: Zeroizing<[u8; MASTER_KEY_LEN]>,
     /// Optional next master key present only during a rotation window.
-    /// When set, the server tries this key first (for already-migrated rows) and falls back to
-    /// `master_key` for rows not yet re-sealed by `octo-migrate-keys`.
+    /// When set, the server seals new records under it, tries it first when opening (for
+    /// already-migrated rows), and falls back to `master_key` for rows not yet re-sealed.
     master_key_next: Option<Zeroizing<[u8; MASTER_KEY_LEN]>>,
     network: StellarNetwork,
     horizon: Horizon,
@@ -34,6 +34,8 @@ struct Inner {
     /// Base URL of the hosted checkout frontend, used to build the `url` field on payment-link
     /// responses (e.g. `https://app.octo.dev/pay/<slug>`). No trailing slash.
     public_app_url: String,
+    /// Hostname of the API's public base URL, used to reject direct self-referential webhooks.
+    public_api_host: Option<String>,
     /// HMAC secret for signing dashboard auth JWTs.
     jwt_secret: Vec<u8>,
     /// Fires signed webhooks (e.g. `transaction.sponsored`) to registered endpoints.
@@ -139,9 +141,28 @@ impl AppState {
         self
     }
 
+    /// Configure the public API URL used to block direct webhook callbacks to this API.
+    pub fn with_public_api_url(mut self, url: Option<&str>) -> Result<Self, &'static str> {
+        let host = url
+            .map(|url| {
+                let parsed = url::Url::parse(url)
+                    .map_err(|_| "PUBLIC_API_URL must be an absolute URL")?;
+                if !matches!(parsed.scheme(), "http" | "https") {
+                    return Err("PUBLIC_API_URL must use http or https");
+                }
+                parsed
+                    .host_str()
+                    .map(str::to_ascii_lowercase)
+                    .ok_or("PUBLIC_API_URL must include a hostname")
+            })
+            .transpose()?;
+        Arc::make_mut(&mut self.inner).public_api_host = host;
+        Ok(self)
+    }
+
     /// Set the next master key for zero-downtime key rotation.
-    /// When set, routes select the key based on the `sealed_scheme` of each wallet row:
-    /// already-migrated rows use `master_key_next`; un-migrated rows use `master_key`.
+    /// When set, new records are sealed under it and existing records are opened by trying it
+    /// first, then `master_key` (see [`AppState::opening_keys`]).
     pub fn with_master_key_next(mut self, key: [u8; MASTER_KEY_LEN]) -> Self {
         let inner = Arc::make_mut(&mut self.inner);
         inner.master_key_next = Some(Zeroizing::new(key));
@@ -176,6 +197,7 @@ impl AppState {
                 horizon_url,
                 friendbot_url,
                 public_app_url,
+                public_api_host: None,
                 jwt_secret,
                 webhooks,
                 email,
@@ -188,8 +210,7 @@ impl AppState {
         let raw = base64::engine::general_purpose::STANDARD
             .decode(b64.trim())
             .map_err(|_| ApiError::BadRequest("invalid MASTER_KEY (base64)".into()))?;
-        master_key_from_slice(&raw)
-            .map_err(|_| ApiError::BadRequest("MASTER_KEY must be 32 bytes".into()))
+        master_key_from_slice(&raw).map_err(|error| ApiError::BadRequest(error.to_string()))
     }
 
     pub fn store(&self) -> &Store {
@@ -214,19 +235,27 @@ impl AppState {
         self.inner.master_key_next.as_deref()
     }
 
-    /// Select the correct master key for a wallet given its `sealed_scheme`.
+    /// Key to seal *new* records under: the next key during a rotation window, so fresh rows
+    /// never need migrating; otherwise the current key.
+    pub fn sealing_key(&self) -> &[u8; MASTER_KEY_LEN] {
+        self.inner
+            .master_key_next
+            .as_deref()
+            .unwrap_or(&self.inner.master_key)
+    }
+
+    /// Keys to try when opening a sealed record, newest first.
     ///
-    /// During a rotation window (`MASTER_KEY_NEXT` is set):
-    /// - Rows already migrated to the target scheme use `master_key_next` (the new key).
-    /// - Rows not yet migrated use `master_key` (the old key).
-    ///
-    /// When no next key is configured, always returns `master_key`.
-    pub fn master_key_for_scheme(&self, sealed_scheme: i16) -> &[u8; MASTER_KEY_LEN] {
-        use octo_crypto::SCHEME_V1;
-        match &self.inner.master_key_next {
-            Some(next_key) if sealed_scheme == SCHEME_V1 as i16 => next_key,
-            _ => &self.inner.master_key,
-        }
+    /// Every V1 record carries the same scheme tag whichever key sealed it, so the tag cannot
+    /// pick the key. AES-GCM authentication does: a wrong key fails cleanly, and the caller
+    /// moves on to the next one. Migrated rows open under the next key, un-migrated rows under
+    /// the current one.
+    pub fn opening_keys(&self) -> impl Iterator<Item = &[u8; MASTER_KEY_LEN]> {
+        self.inner
+            .master_key_next
+            .as_deref()
+            .into_iter()
+            .chain(std::iter::once(&*self.inner.master_key))
     }
 
     pub fn jwt_secret(&self) -> &[u8] {
@@ -260,5 +289,9 @@ impl AppState {
     /// Base URL of the hosted checkout frontend (no trailing slash).
     pub fn public_app_url(&self) -> &str {
         &self.inner.public_app_url
+    }
+
+    pub fn public_api_host(&self) -> Option<&str> {
+        self.inner.public_api_host.as_deref()
     }
 }

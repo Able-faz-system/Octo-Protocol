@@ -185,7 +185,13 @@ mod tests {
     /// A valid payment XDR signed by the vector wallet (source == WALLET_ACCOUNT).
     fn signed_payment_xdr() -> String {
         let provisioned =
-            import_wallet(&VECTOR_MK, StellarNetwork::Testnet, VECTOR_MNEMONIC).unwrap();
+            import_wallet(
+                &VECTOR_MK,
+                StellarNetwork::Testnet,
+                VECTOR_MNEMONIC,
+                WALLET_ACCOUNT,
+            )
+            .unwrap();
         sign_payment(
             &VECTOR_MK,
             &provisioned.sealed,

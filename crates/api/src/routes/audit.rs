@@ -23,7 +23,19 @@ pub async fn list_audit_logs(
     Query(q): Query<AuditQuery>,
 ) -> ApiResult<Json<Envelope<Vec<octo_store::AuditLog>>>> {
     let user_id = authenticate(&headers, &state).await?;
-    let category = q.category.filter(|c| !c.is_empty() && c != "all");
+    let category = match q.category.filter(|c| !c.is_empty() && c != "all") {
+        Some(cat) => {
+            if !crate::audit::category::ALL.contains(&cat.as_str()) {
+                return Err(ApiError::BadRequest(format!(
+                    "invalid category filter '{}'; valid categories are: {}",
+                    cat,
+                    crate::audit::category::ALL.join(", ")
+                )));
+            }
+            Some(cat)
+        }
+        None => None,
+    };
     let search = q.search.filter(|s| !s.is_empty());
 
     let rows = state

@@ -6,11 +6,18 @@ meta {
 
 post {
   url: {{base_url}}/v1/wallets/{{wallet_id}}/api-key
+  body: json
   auth: none
 }
 
 headers {
   authorization: Bearer {{token}}
+}
+
+body:json {
+  {
+    "confirm": true
+  }
 }
 
 script:post-response {
@@ -20,7 +27,9 @@ script:post-response {
 }
 
 docs {
-  Generates (or regenerates, invalidating the previous one) this wallet's API key. Shown once
-  — save it. Auto-saved to api_key, which is what an integrating merchant's backend would use
-  instead of a dashboard JWT for server-to-server calls (e.g. creating payment links).
+  Generates this wallet's API key. Shown once — save it. The first key needs no body; once a key
+  exists, rotating it (which immediately invalidates the previous one) requires "confirm": true,
+  otherwise the call returns 409. Sent here with confirm so the request is re-runnable.
+  Auto-saved to api_key, which is what an integrating merchant's backend would use instead of a
+  dashboard JWT for server-to-server calls (e.g. creating payment links).
 }

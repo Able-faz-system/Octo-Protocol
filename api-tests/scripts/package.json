@@ -4,5 +4,8 @@
   "type": "module",
   "dependencies": {
     "@stellar/stellar-base": "^15.0.0"
+  },
+  "devDependencies": {
+    "@usebruno/cli": "^1.39.0"
   }
 }

@@ -155,3 +155,12 @@ ciphertext sealed under one context fails authentication under another.
   with a `stellar` context.
 - Any new chain must define its own context string; reusing another chain's context is a bug.
 </｜｜DSML｜｜ parameter>
+
+---
+
+## Database access
+
+The server talks to Postgres through `octo-store`. In production it should connect as a
+least-privilege runtime role (`octo_app`, `RUN_MIGRATIONS=false`) while a separate migrator role
+applies migrations with `octo-server --migrate-only`. Roles, exact grants and the runbook:
+[postgres-roles.md](postgres-roles.md).

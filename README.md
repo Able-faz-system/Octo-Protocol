@@ -48,6 +48,8 @@ A Cargo workspace; all secret-handling is isolated in `wallet-core` and zeroized
 | [`bin/server`](bin/server) | composes `api` + `ingest` into one service |
 
 See [docs/architecture.md](docs/architecture.md).
+The persisted encryption compatibility contract is documented in
+[docs/sealed-seed-versioning.md](docs/sealed-seed-versioning.md).
 
 ## Quickstart
 
@@ -102,7 +104,9 @@ curl -s -X POST localhost:8080/v1/wallets/<WALLET_ID>/submit-signed \
 ```
 
 See [docs/non-custodial-flow.md](docs/non-custodial-flow.md) for the full
-build → sign → relay sequence.
+build → sign → relay sequence. Accepting payments via a shareable link is walked through in
+[docs/api.md](docs/api.md#payment-link-checkout-flow); account activity categories are in
+[docs/audit-log.md](docs/audit-log.md).
 
 ## Security architecture
 
@@ -209,6 +213,43 @@ the *outer* fee-bump envelope only. The user's inner transaction is passed throu
 Full mapping in **[docs/threat-model.md](docs/threat-model.md)**. Amounts are integer **stroops**
 end-to-end (never floats). Report vulnerabilities per **[SECURITY.md](SECURITY.md)** — **do not**
 open public issues for security reports.
+
+## Documentation
+
+- [Architecture Overview](docs/architecture.md)
+- [Threat Model & Security](docs/threat-model.md)
+- [Deposit Model & Attribution](docs/deposit-model.md)
+- [Non-Custodial Transaction Flow](docs/non-custodial-flow.md)
+- [Operational Runbook: Key Migration](docs/runbook-migrate-keys.md)
+- [Operational Runbook: Operation Index Backfill](docs/runbook-backfill-operation-index.md)
+- [Backfill Constraint Safety Analysis](docs/backfill-constraint-analysis.md)
+- [REST API Specification](docs/api.md)
+
+## Deployment
+
+`octo-server` runs the REST API and the deposit ingest worker in one process and is safe to
+roll (Kubernetes, ECS, systemd) behind a load balancer.
+
+### Graceful shutdown
+
+On `SIGTERM` (or `SIGINT`) the server:
+
+1. logs `shutdown signal received` and stops accepting new connections;
+2. logs `draining …` and lets in-flight HTTP requests complete, while the ingest supervisor
+   finishes its **current tick** (never aborting a page mid-processing) and then stops;
+3. logs `drained` then `exiting` — or, if the drain outlasts the timeout, logs
+   `drain timeout elapsed; forcing exit` and exits anyway. A page cut short this way is safe:
+   the ingest cursor is only advanced after processing and deposit inserts are idempotent, so
+   the next instance re-runs it without double-crediting.
+
+| Variable | Default | Description |
+|---|---|---|
+| `SHUTDOWN_DRAIN_TIMEOUT_SECS` | `25` | Max seconds to drain before force-exiting |
+
+**Tuning:** keep `SHUTDOWN_DRAIN_TIMEOUT_SECS` a few seconds *below* the orchestrator's hard-kill
+deadline (Kubernetes `terminationGracePeriodSeconds`, default 30; ECS `stopTimeout`, default
+30), so the process exits on its own terms rather than being `SIGKILL`ed mid-drain. If ticks
+routinely run long (many wallets, slow Horizon), raise both values together.
 
 ## Roadmap
 

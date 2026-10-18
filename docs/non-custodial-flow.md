@@ -13,7 +13,8 @@ customer balances.
 - Client key handling / signing: `src/lib/sdk/` (frontend)
 - Submit + validation: `crates/api/src/routes/submit.rs`, `crates/api/src/submit_validation.rs`
 - Wallet creation / backup / gas tank: `crates/api/src/routes/wallets.rs`
-- Custodial endpoints (`/withdraw`, `/trustlines`) now return **410 Gone**.
+- Trustlines: `crates/api/src/routes/trustlines.rs` (signing info only; client signs)
+- The custodial `/withdraw` endpoint now returns **410 Gone**.
 
 ---
 
@@ -26,7 +27,8 @@ customer balances.
 | Who signs a withdrawal | Octo's server | The user, locally |
 | Withdraw request body | `destination` + `amount` (server signs) | A fully **signed transaction (XDR)** (server relays) |
 | Full server breach | Can drain every wallet | Cannot move funds — no keys to steal |
-| `POST /withdraw`, `POST /trustlines` | Server-signs | **410 Gone** → `POST /submit-signed` |
+| `POST /withdraw` | Server-signs | **410 Gone** → `POST /submit-signed` |
+| `POST /trustlines` | Server-signs | Returns signing info → client signs → `POST /submit-signed` |
 | Gas sponsorship | Fee-bump from the wallet's own seed | Fee-bump from a separate gas tank (fee float only) |
 | Lost password **and** phrase | Octo could reset | Unrecoverable (the non-custodial trade-off) |
 | Deposits / addresses / balances | — | Unchanged (never needed a key) |

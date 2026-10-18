@@ -4,7 +4,7 @@
 //! `G...` + numeric `memo_id` fallback for senders that don't support muxed (see
 //! `docs/deposit-model.md`).
 
-use crate::auth::authorize_wallet;
+use crate::auth::{authorize_wallet, authorize_wallet_scope};
 use crate::error::{ApiResult, Envelope};
 use crate::json::parse_optional;
 use crate::routes::wallets::ListParams;
@@ -62,11 +62,14 @@ pub async fn create_address(
     body: Bytes,
 ) -> ApiResult<(StatusCode, Json<Envelope<AddressView>>)> {
     // Authorize via login JWT (wallet owner) or API key (key's wallet).
-    authorize_wallet(&headers, &state, wallet_id).await?;
+    authorize_wallet_scope(&headers, &state, wallet_id, "write").await?;
     let req: CreateAddressRequest = parse_optional(&body)?;
 
     // Fetch the wallet to learn its base G... account (the muxed addresses encode it).
     let wallet = state.store().get_wallet(wallet_id).await?;
+    if wallet.is_archived() {
+        return Err(ApiError::Forbidden("wallet is archived".into()));
+    }
     let base = wallet.stellar_account_g.clone();
 
     let metadata = req.metadata.unwrap_or_else(|| serde_json::json!({}));

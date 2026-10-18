@@ -133,7 +133,13 @@ mod tests {
     /// A valid payment XDR signed by account 0 of the vector mnemonic.
     fn payment_xdr() -> String {
         let provisioned =
-            import_wallet(&VECTOR_MK, StellarNetwork::Testnet, VECTOR_MNEMONIC).unwrap();
+            import_wallet(
+                &VECTOR_MK,
+                StellarNetwork::Testnet,
+                VECTOR_MNEMONIC,
+                MASTER_ACCOUNT_0,
+            )
+            .unwrap();
         sign_payment(
             &VECTOR_MK,
             &provisioned.sealed,

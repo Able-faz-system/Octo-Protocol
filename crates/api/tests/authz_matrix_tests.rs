@@ -185,6 +185,11 @@ fn guarded_routes() -> Vec<GuardedRoute> {
             },
         },
         GuardedRoute {
+            name: "GET /v1/wallets/:id/gas-tank",
+            method: "GET",
+            path: |id| format!("/v1/wallets/{id}/gas-tank"),
+        },
+        GuardedRoute {
             name: "GET /v1/wallets/:id/sponsorship",
             method: "GET",
             path: |id| format!("/v1/wallets/{id}/sponsorship"),
@@ -284,5 +289,255 @@ async fn api_key_for_wallet_a_is_404_on_every_guarded_route_for_wallet_b() {
             route.name,
             resp.status()
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// payment_links.rs — owner-authenticated routes mixed with fully public ones.
+//
+// Credential shapes: no credential, a stranger's login, the owner's login, the owner wallet's API
+// key, and a stranger wallet's API key. Owner routes go through `authorize_wallet`; the public
+// `/v1/pay/*` routes must ignore credentials entirely, so every credential must get the identical
+// response. Public routes are exercised on paths that never reach Horizon (offline-deterministic).
+// ---------------------------------------------------------------------------
+
+/// A JSON-body request with an optional bearer credential.
+fn req_json(method: &str, uri: &str, token: Option<&str>, body: &str) -> Request<Body> {
+    let mut b = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json");
+    if let Some(t) = token {
+        b = b.header("authorization", format!("Bearer {t}"));
+    }
+    b.body(Body::from(body.to_string())).unwrap()
+}
+
+/// Send `req` and return `(status, body json)`.
+async fn send(app: &axum::Router, req: Request<Body>) -> (StatusCode, serde_json::Value) {
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap_or_default())
+}
+
+/// Create a payment link on `wallet_id` as its owner and return `(link_id, slug)`.
+async fn create_link(app: &axum::Router, token: &str, wallet_id: &str) -> (String, String) {
+    let (status, json) = send(
+        app,
+        req_json(
+            "POST",
+            &format!("/v1/wallets/{wallet_id}/payment-links"),
+            Some(token),
+            r#"{"name":"matrix link","amount_usdc_stroops":10000000}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    (
+        json["data"]["id"].as_str().unwrap().to_string(),
+        json["data"]["slug"].as_str().unwrap().to_string(),
+    )
+}
+
+/// Every owner-authenticated payment-links route × every credential shape, with the exact expected
+/// status in each cell.
+#[tokio::test]
+async fn payment_links_owner_routes_authorization_matrix() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL");
+        return;
+    };
+    let app = build_router(state.clone());
+
+    let owner = auth_token(&app, &state).await;
+    let wallet = create_wallet(&app, &owner).await;
+    let owner_key = api_key_for(&app, &owner, &wallet).await;
+    let (link_id, _) = create_link(&app, &owner, &wallet).await;
+
+    let stranger = auth_token(&app, &state).await;
+    let stranger_wallet = create_wallet(&app, &stranger).await;
+    let stranger_key = api_key_for(&app, &stranger, &stranger_wallet).await;
+
+    let base = format!("/v1/wallets/{wallet}/payment-links");
+    let one = format!("{base}/{link_id}");
+    let payments = format!("{one}/payments");
+
+    // (name, method, uri, body, success status)
+    let routes: Vec<(&str, &str, &str, &str, StatusCode)> = vec![
+        (
+            "POST payment-links",
+            "POST",
+            &base,
+            r#"{"name":"another","amount_usdc_stroops":5}"#,
+            StatusCode::CREATED,
+        ),
+        ("GET payment-links", "GET", &base, "", StatusCode::OK),
+        (
+            "GET payment-links/:link_id",
+            "GET",
+            &one,
+            "",
+            StatusCode::OK,
+        ),
+        (
+            "PUT payment-links/:link_id",
+            "PUT",
+            &one,
+            r#"{"active":true}"#,
+            StatusCode::OK,
+        ),
+        (
+            "GET payment-links/:link_id/payments",
+            "GET",
+            &payments,
+            "",
+            StatusCode::OK,
+        ),
+    ];
+
+    for (name, method, uri, body, ok) in routes {
+        let cells: [(&str, Option<&str>, StatusCode); 5] = [
+            ("no credential", None, StatusCode::UNAUTHORIZED),
+            ("wrong-owner login", Some(&stranger), StatusCode::NOT_FOUND),
+            (
+                "wrong-wallet API key",
+                Some(&stranger_key),
+                StatusCode::NOT_FOUND,
+            ),
+            ("correct-owner login", Some(&owner), ok),
+            ("correct-wallet API key", Some(&owner_key), ok),
+        ];
+        for (cred, token, expected) in cells {
+            let (status, _) = send(&app, req_json(method, uri, token, body)).await;
+            assert_eq!(status, expected, "{name} with {cred}");
+        }
+    }
+}
+
+/// A stranger acting through *their own* wallet id but the victim's link id must not reach the
+/// victim's link — no IDOR via a mismatched (wallet, link) pair.
+#[tokio::test]
+async fn payment_links_owner_routes_reject_a_foreign_link_id_under_your_own_wallet() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL");
+        return;
+    };
+    let app = build_router(state.clone());
+
+    let victim = auth_token(&app, &state).await;
+    let victim_wallet = create_wallet(&app, &victim).await;
+    let (victim_link, _) = create_link(&app, &victim, &victim_wallet).await;
+
+    let attacker = auth_token(&app, &state).await;
+    let attacker_wallet = create_wallet(&app, &attacker).await;
+    let attacker_key = api_key_for(&app, &attacker, &attacker_wallet).await;
+    let one = format!("/v1/wallets/{attacker_wallet}/payment-links/{victim_link}");
+    let payments = format!("{one}/payments");
+
+    for token in [&attacker, &attacker_key] {
+        for (method, uri, body) in [
+            ("GET", &one, ""),
+            ("PUT", &one, r#"{"active":false}"#),
+            ("GET", &payments, ""),
+        ] {
+            let (status, _) = send(&app, req_json(method, uri, Some(token), body)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}");
+        }
+    }
+    // The victim's link is untouched.
+    let uri = format!("/v1/wallets/{victim_wallet}/payment-links/{victim_link}");
+    let (status, json) = send(&app, req_json("GET", &uri, Some(&victim), "")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["data"]["active"], true);
+}
+
+/// Every public `/v1/pay/*` route must answer identically whatever credential is presented — a
+/// credential must neither be required nor change the outcome.
+#[tokio::test]
+async fn payment_links_public_routes_ignore_credentials() {
+    let Some(state) = test_state().await else {
+        eprintln!("SKIPPED: set DATABASE_URL");
+        return;
+    };
+    let app = build_router(state.clone());
+
+    let owner = auth_token(&app, &state).await;
+    let wallet = create_wallet(&app, &owner).await;
+    let owner_key = api_key_for(&app, &owner, &wallet).await;
+    let stranger = auth_token(&app, &state).await;
+    let (_, slug) = create_link(&app, &owner, &wallet).await;
+    // An inactive link makes signing-info 404 before it would ever call Horizon.
+    let (inactive_id, inactive_slug) = create_link(&app, &owner, &wallet).await;
+    let uri = format!("/v1/wallets/{wallet}/payment-links/{inactive_id}");
+    let (status, _) = send(
+        &app,
+        req_json("PUT", &uri, Some(&owner), r#"{"active":false}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A real payment intent to poll (created without a credential).
+    let (status, json) = send(
+        &app,
+        req_json("POST", &format!("/v1/pay/{slug}/intent"), None, "{}"),
+    )
+    .await;
+    // The link is fixed-amount, so an empty body is a valid intent.
+    assert_eq!(status, StatusCode::CREATED);
+    let payment_id = json["data"]["payment_id"].as_str().unwrap().to_string();
+
+    let get_link = format!("/v1/pay/{slug}");
+    let intent = format!("/v1/pay/{slug}/intent");
+    let status_uri = format!("/v1/pay/{slug}/payments/{payment_id}");
+    let signing = format!("/v1/pay/{inactive_slug}/signing-info");
+    let submit = format!("/v1/pay/{slug}/submit-signed");
+
+    // (name, method, uri, body, expected status)
+    let routes: Vec<(&str, &str, &str, &str, StatusCode)> = vec![
+        ("GET pay/:slug", "GET", &get_link, "", StatusCode::OK),
+        (
+            "POST pay/:slug/intent",
+            "POST",
+            &intent,
+            "{}",
+            StatusCode::CREATED,
+        ),
+        (
+            "GET pay/:slug/payments/:id",
+            "GET",
+            &status_uri,
+            "",
+            StatusCode::OK,
+        ),
+        (
+            "GET pay/:slug/signing-info",
+            "GET",
+            &signing,
+            "",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "POST pay/:slug/submit-signed",
+            "POST",
+            &submit,
+            "{}",
+            StatusCode::BAD_REQUEST,
+        ),
+    ];
+
+    for (name, method, uri, body, expected) in routes {
+        let creds: [(&str, Option<&str>); 4] = [
+            ("no credential", None),
+            ("stranger login", Some(&stranger)),
+            ("owner login", Some(&owner)),
+            ("owner API key", Some(&owner_key)),
+        ];
+        for (cred, token) in creds {
+            let (status, _) = send(&app, req_json(method, uri, token, body)).await;
+            assert_eq!(status, expected, "{name} with {cred}");
+        }
     }
 }

@@ -1,17 +1,29 @@
 //! Stellar credit-asset code validation — the single shared primitive for every call site that
 //! accepts, constructs, or forwards a caller/network-supplied asset code string.
 //!
-//! ## Finding: this validator is deliberately length-only, not alphanumeric-only
+//! ## Validation policy
 //!
-//! Accepts asset codes matching `Asset::new_credit` — 1 to 12 UTF-8 bytes, no alphanumeric restriction.
-//! This mirrors actual Stellar behavior for referencing on-chain assets, not issuing new ones.
-//! For stricter (e.g., alphanumeric) checks, layer such validation separately.
+//! Credit asset codes follow `Asset::new_credit`'s 1-to-12-byte constraints, without an
+//! alphanumeric restriction. Octo additionally rejects `XLM` and `native` (case-insensitively)
+//! as credit codes to avoid confusing issued assets with the native asset. The Stellar
+//! constructor itself accepts those spellings; this is an Octo policy, not a protocol rule.
 
-/// Returns `true` if `code` is a valid Stellar asset code: 1 to 12 UTF-8 bytes.
-/// Matches `Asset::new_credit` acceptance; do not duplicate this logic.
-/// Note: len is in bytes, so multi-byte chars may exceed limit.
+use crate::error::WalletError;
+
+/// Returns `true` if `code` is acceptable as an Octo credit-asset code.
+/// Length is measured in bytes; native-asset spellings are reserved by Octo policy.
 pub fn is_valid_asset_code(code: &str) -> bool {
-    (1..=12).contains(&code.len())
+    validate_asset_code(code).is_ok()
+}
+
+pub(crate) fn validate_asset_code(code: &str) -> Result<(), WalletError> {
+    if code.eq_ignore_ascii_case("XLM") || code.eq_ignore_ascii_case("native") {
+        return Err(WalletError::ReservedNativeAssetCode);
+    }
+    if !(1..=12).contains(&code.len()) {
+        return Err(WalletError::InvalidAssetCode);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -32,6 +44,12 @@ mod tests {
     /// Ground truth: does `stellar_base::asset::Asset::new_credit` actually accept `code`?
     fn asset_new_credit_accepts(code: &str) -> bool {
         Asset::new_credit(code.to_string(), issuer()).is_ok()
+    }
+
+    fn octo_policy_matches_asset_constructor(code: &str) -> bool {
+        asset_new_credit_accepts(code)
+            && !code.eq_ignore_ascii_case("XLM")
+            && !code.eq_ignore_ascii_case("native")
     }
 
     // --- explicit boundary tests -------------------------------------------------------------
@@ -68,6 +86,18 @@ mod tests {
     fn accepts_1_character_the_smallest_valid_code() {
         assert!(is_valid_asset_code("X"));
         assert!(asset_new_credit_accepts("X"));
+    }
+
+    #[test]
+    fn rejects_reserved_native_spellings_case_insensitively() {
+        for code in ["XLM", "xlm", "Xlm", "native", "NATIVE", "Native"] {
+            assert!(asset_new_credit_accepts(code));
+            assert!(!is_valid_asset_code(code));
+            assert!(matches!(
+                validate_asset_code(code),
+                Err(WalletError::ReservedNativeAssetCode)
+            ));
+        }
     }
 
     // --- regression / edge cases the description called out explicitly ----------------------
@@ -127,7 +157,7 @@ mod tests {
         ) {
             let code: String = chars.into_iter().collect();
             let ours = is_valid_asset_code(&code);
-            let library = asset_new_credit_accepts(&code);
+            let library = octo_policy_matches_asset_constructor(&code);
             prop_assert_eq!(
                 ours,
                 library,
@@ -148,7 +178,7 @@ mod tests {
             // Printable ASCII only, so this always round-trips through String validly.
             let b = byte % (0x7e - 0x20) + 0x20;
             let code: String = std::iter::repeat(b as char).take(len).collect();
-            prop_assert_eq!(is_valid_asset_code(&code), asset_new_credit_accepts(&code));
+            prop_assert_eq!(is_valid_asset_code(&code), octo_policy_matches_asset_constructor(&code));
         }
     }
 }

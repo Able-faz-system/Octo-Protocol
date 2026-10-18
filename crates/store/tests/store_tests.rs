@@ -850,13 +850,13 @@ async fn migrate_applies_exactly_the_expected_version_set() {
     .expect("query _sqlx_migrations");
     versions.sort_unstable();
 
-    // One version per file under crates/store/migrations/, 0001_init.sql .. 0020.
+    // One version per file under crates/store/migrations/, 0001_init.sql .. 0021.
     // Guards against silent version collisions — sqlx keys migrations by version, so a repeated
     // number means only one of the colliding pair actually ran.
     assert_eq!(
         versions,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
-        "expected exactly the twenty known migrations to be recorded as applied"
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21],
+        "expected exactly the twenty-one known migrations to be recorded as applied"
     );
 }
 
@@ -1199,4 +1199,128 @@ async fn mark_polled_creates_and_updates_the_cursor_row() {
         token.is_none(),
         "mark_polled must not fabricate a cursor position"
     );
+}
+
+#[tokio::test]
+async fn reseal_wallet_leaves_the_row_completely_unchanged_when_the_update_violates_a_constraint() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+
+    // Get initial wallet state
+    let before = store.get_wallet(wallet_id).await.expect("get wallet before");
+    assert_eq!(before.sealed_scheme, Some(1));
+    assert_eq!(before.sealed_ciphertext.as_deref(), Some(b"ciphertext" as &[u8]));
+    assert_eq!(before.sealed_nonce.as_deref(), Some(b"nonce12bytes" as &[u8]));
+    assert_eq!(before.sealed_salt.as_deref(), Some(b"saltsaltsaltsalt" as &[u8]));
+
+    // Attempt reseal_wallet with an invalid scheme value (0) that violates the
+    // wallets_sealed_scheme_check CHECK constraint (requires sealed_scheme IS NULL OR sealed_scheme >= 1).
+    let result = store
+        .reseal_wallet(
+            wallet_id,
+            b"new_ciphertext",
+            b"new_nonce12byt",
+            b"new_saltsaltsaltsalt",
+            0, // invalid scheme violating check constraint (0 < 1)
+            1,   // expected old scheme
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "reseal_wallet must fail when new_scheme violates a CHECK constraint"
+    );
+
+    // Verify that the row is completely unchanged (statement atomicity: zero partial updates).
+    let after = store.get_wallet(wallet_id).await.expect("get wallet after");
+    assert_eq!(
+        after.sealed_scheme, before.sealed_scheme,
+        "sealed_scheme must be completely unchanged"
+    );
+    assert_eq!(
+        after.sealed_ciphertext, before.sealed_ciphertext,
+        "sealed_ciphertext must be completely unchanged"
+    );
+    assert_eq!(
+        after.sealed_nonce, before.sealed_nonce,
+        "sealed_nonce must be completely unchanged"
+    );
+    assert_eq!(
+        after.sealed_salt, before.sealed_salt,
+        "sealed_salt must be completely unchanged"
+    );
+    assert_eq!(
+        after.updated_at, before.updated_at,
+        "updated_at must be completely unchanged (zero partial effect)"
+    );
+}
+
+#[tokio::test]
+async fn migrate_applies_cleanly_from_a_genuinely_empty_database() {
+    let Some(base_url) = database_url() else {
+        eprintln!("SKIPPED: DATABASE_URL is not set");
+        return;
+    };
+
+    // Connect to base Postgres instance to provision an isolated empty database.
+    let base_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&base_url)
+        .await
+        .expect("connect to base postgres");
+
+    // Create fresh empty database with random name.
+    let empty_db_name = format!("octo_empty_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE DATABASE \"{empty_db_name}\""))
+        .execute(&base_pool)
+        .await
+        .expect("create empty test database");
+
+    // Format connection URL targeting the newly created database.
+    let (prefix, query) = match base_url.rsplit_once('/') {
+        Some((p, rest)) => match rest.split_once('?') {
+            Some((_, q)) => (p, format!("?{}", q)),
+            None => (p, String::new()),
+        },
+        None => panic!("invalid DATABASE_URL format"),
+    };
+    let empty_db_url = format!("{prefix}/{empty_db_name}{query}");
+
+    // Connect Store handle and run all migrations from empty state.
+    let store = Store::connect(&empty_db_url)
+        .await
+        .expect("connect to empty database");
+    store
+        .migrate()
+        .await
+        .expect("migrations must apply cleanly from empty database");
+
+    // Sanity check that core tables were created by the migrations.
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
+    )
+    .fetch_all(store.pool())
+    .await
+    .expect("query tables");
+
+    let tables: std::collections::HashSet<String> = rows.into_iter().map(|r| r.0).collect();
+    assert!(tables.contains("wallets"), "wallets table must exist");
+    assert!(tables.contains("addresses"), "addresses table must exist");
+    assert!(tables.contains("transactions"), "transactions table must exist");
+    assert!(tables.contains("withdrawals"), "withdrawals table must exist");
+    assert!(tables.contains("webhook_endpoints"), "webhook_endpoints table must exist");
+    assert!(tables.contains("webhook_deliveries"), "webhook_deliveries table must exist");
+    assert!(tables.contains("_sqlx_migrations"), "_sqlx_migrations table must exist");
+
+    // Close connections to empty database.
+    drop(store);
+
+    // Drop temporary test database to clean up resources.
+    let _ = sqlx::query(&format!(
+        "DROP DATABASE IF EXISTS \"{empty_db_name}\" WITH (FORCE)"
+    ))
+    .execute(&base_pool)
+    .await;
+}
+
 }

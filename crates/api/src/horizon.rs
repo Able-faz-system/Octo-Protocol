@@ -217,7 +217,13 @@ impl Horizon {
 
     /// Fetch an account's balances. Retried on transient failures (transport errors, 5xx).
     /// Returns `NotFound` if the account does not exist on-chain yet.
+    #[tracing::instrument(
+        name = "horizon_balances",
+        skip(self),
+        fields(call_type = "balances", account_g = %account_g, outcome = tracing::field::Empty)
+    )]
     pub async fn balances(&self, account_g: &str) -> Result<Vec<Balance>, ApiError> {
+        let span = tracing::Span::current();
         let url = format!(
             "{}/accounts/{}",
             self.base_url.trim_end_matches('/'),
@@ -250,21 +256,48 @@ impl Horizon {
         })
         .await;
 
+        match &result {
+            Ok(_) => span.record("outcome", "success"),
+            Err(ResilienceError::Circuit) => span.record("outcome", "circuit_open"),
+            Err(ResilienceError::Exhausted(FetchError::NotFound)) => {
+                span.record("outcome", "not_found")
+            }
+            Err(ResilienceError::Exhausted(_)) => span.record("outcome", "failure"),
+        };
+
         map_result(result)
     }
 
     /// Fetch an account's current sequence number. Retried on transient failures.
     /// Returns `NotFound` if the account doesn't exist.
+    #[tracing::instrument(
+        name = "horizon_account_sequence",
+        skip(self),
+        fields(call_type = "account_sequence", account_g = %account_g, outcome = tracing::field::Empty)
+    )]
     pub async fn account_sequence(&self, account_g: &str) -> Result<i64, ApiError> {
-        self.account_info(account_g).await.map(|a| a.sequence)
+        let span = tracing::Span::current();
+        let res = self.account_info(account_g).await.map(|a| a.sequence);
+        match &res {
+            Ok(_) => span.record("outcome", "success"),
+            Err(ApiError::NotFound) => span.record("outcome", "not_found"),
+            Err(_) => span.record("outcome", "failure"),
+        };
+        res
     }
 
     /// Fetch balances, sequence, and reserve inputs for an account in a single Horizon call.
     /// `NotFound` if the account does not exist on-chain yet.
+    #[tracing::instrument(
+        name = "horizon_account_info",
+        skip(self),
+        fields(call_type = "account_info", account_g = %account_g, outcome = tracing::field::Empty)
+    )]
     pub async fn account_info(&self, account_g: &str) -> Result<AccountInfo, ApiError> {
         // This is a read-only call, so it goes through the same retry + circuit-breaker path as
         // `balances`. (It previously issued a bare, unwrapped GET, so a transient 5xx from
         // Horizon failed immediately instead of being retried.)
+        let span = tracing::Span::current();
         let url = format!(
             "{}/accounts/{}",
             self.base_url.trim_end_matches('/'),
@@ -309,6 +342,15 @@ impl Horizon {
         })
         .await;
 
+        match &result {
+            Ok(_) => span.record("outcome", "success"),
+            Err(ResilienceError::Circuit) => span.record("outcome", "circuit_open"),
+            Err(ResilienceError::Exhausted(FetchError::NotFound)) => {
+                span.record("outcome", "not_found")
+            }
+            Err(ResilienceError::Exhausted(_)) => span.record("outcome", "failure"),
+        };
+
         match result {
             Ok(info) => Ok(info),
             Err(ResilienceError::Circuit) => Err(ApiError::Internal),
@@ -326,11 +368,17 @@ impl Horizon {
     ///
     /// Returns the result even when the transaction failed on-chain (`successful == false`) so the
     /// caller can record the failure; only transport/HTTP errors return `Err`.
+    #[tracing::instrument(
+        name = "horizon_submit_transaction",
+        skip(self, envelope_xdr),
+        fields(call_type = "submit", outcome = tracing::field::Empty)
+    )]
     pub async fn submit_transaction(&self, envelope_xdr: &str) -> Result<SubmitResult, ApiError> {
         // NOTE: an eager, unwrapped POST used to sit here ahead of the resilience-wrapped call
         // below. It fired a *duplicate* submission on every call and referenced `http`/`xdr`
         // locals that were never bound (so this did not compile). Removed — the single submit
         // now happens inside `execute`, with SUBMIT_TIMEOUT applied to that request.
+        let span = tracing::Span::current();
         let url = format!("{}/transactions", self.base_url.trim_end_matches('/'));
         let http = self.http.clone();
         let xdr = envelope_xdr.to_string();
@@ -378,6 +426,21 @@ impl Horizon {
         })
         .await;
 
+        match &result {
+            Ok(r) => {
+                if r.successful {
+                    span.record("outcome", "success");
+                } else {
+                    span.record("outcome", "tx_failed");
+                }
+            }
+            Err(ResilienceError::Circuit) => span.record("outcome", "circuit_open"),
+            Err(ResilienceError::Exhausted(FetchError::TxRejected)) => {
+                span.record("outcome", "rejected")
+            }
+            Err(ResilienceError::Exhausted(_)) => span.record("outcome", "failure"),
+        };
+
         match result {
             Ok(r) => Ok(r),
             Err(ResilienceError::Circuit) => Err(ApiError::Internal),
@@ -385,6 +448,23 @@ impl Horizon {
                 "transaction rejected by network".into(),
             )),
             Err(ResilienceError::Exhausted(_)) => Err(ApiError::Internal),
+        }
+    }
+
+    // Probe Horizon root endpoint to verify node reachability.
+    pub async fn check_reachability(&self) -> Result<(), String> {
+        let url = self.base_url.trim_end_matches('/');
+        let resp = self
+            .http
+            .get(url)
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await
+            .map_err(|e| format!("horizon unreachable: {e}"))?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!("horizon returned HTTP {}", resp.status()))
         }
     }
 }
@@ -443,8 +523,19 @@ fn map_result<T>(r: Result<T, ResilienceError<FetchError>>) -> Result<T, ApiErro
 
 /// Fund a testnet account via friendbot. Best-effort; a single retry is safe because friendbot
 /// is idempotent (re-funding an already-funded account is a no-op on testnet).
+#[tracing::instrument(
+    name = "horizon_friendbot_fund",
+    skip(friendbot_url),
+    fields(call_type = "friendbot", account_g = %account_g, outcome = tracing::field::Empty)
+)]
 pub async fn friendbot_fund(friendbot_url: &str, account_g: &str) -> Result<(), ApiError> {
-    friendbot_fund_with_timeout(friendbot_url, account_g, DEFAULT_TIMEOUT).await
+    let span = tracing::Span::current();
+    let res = friendbot_fund_with_timeout(friendbot_url, account_g, DEFAULT_TIMEOUT).await;
+    match &res {
+        Ok(_) => span.record("outcome", "success"),
+        Err(_) => span.record("outcome", "failure"),
+    };
+    res
 }
 
 async fn friendbot_fund_with_timeout(
@@ -524,5 +615,56 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(ApiError::Internal)));
+    }
+
+    // Asserts that every Horizon call type emits its distinct named tracing span.
+    #[tokio::test]
+    async fn horizon_calls_emit_named_tracing_spans() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let recorded_spans = Arc::new(Mutex::new(Vec::<String>::new()));
+        let spans_clone = recorded_spans.clone();
+
+        struct SpanRecorder(Arc<Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SpanRecorder {
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                _id: &tracing::span::Id,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                self.0.lock().unwrap().push(attrs.metadata().name().to_string());
+            }
+        }
+
+        let subscriber = tracing_subscriber::registry().with(SpanRecorder(spans_clone));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let base_url = hanging_server().await;
+        let horizon = Horizon {
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_millis(50))
+                .build()
+                .unwrap(),
+            base_url: base_url.clone(),
+            retry: RetryPolicy {
+                max_attempts: 1,
+                ..Default::default()
+            },
+            circuit: CircuitBreaker::new(u32::MAX, Duration::from_secs(60)),
+        };
+
+        let _ = horizon.balances("GABCDEFGHIJKLMNOPQRSTUVWXYZ").await;
+        let _ = horizon.account_sequence("GABCDEFGHIJKLMNOPQRSTUVWXYZ").await;
+        let _ = horizon.submit_transaction("AAAA").await;
+        let _ = friendbot_fund("http://127.0.0.1:1", "GABCDEFGHIJKLMNOPQRSTUVWXYZ").await;
+
+        let spans = recorded_spans.lock().unwrap().clone();
+        assert!(spans.contains(&"horizon_balances".to_string()));
+        assert!(spans.contains(&"horizon_account_sequence".to_string()));
+        assert!(spans.contains(&"horizon_account_info".to_string()));
+        assert!(spans.contains(&"horizon_submit_transaction".to_string()));
+        assert!(spans.contains(&"horizon_friendbot_fund".to_string()));
     }
 }

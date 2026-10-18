@@ -25,17 +25,16 @@
 //!
 //! ## Idempotency
 //!
-//! The store method `reseal_wallet` only updates a row when its current `sealed_scheme` matches
-//! the expected "old" scheme. Re-running the tool against a fully-migrated database is safe and
-//! produces 0 updates.
+//! A row that already opens under the new key is skipped, and `reseal_wallet` only writes when
+//! the row still holds the ciphertext that was read (compare-and-swap). Re-running the tool
+//! against a fully-migrated database is safe and produces 0 updates. See `lib.rs`.
 //!
 //! ## Rollback
 //!
-//! Old-scheme and new-scheme records can coexist in the database indefinitely because every open
-//! call reads the scheme tag from the row and picks the correct key. To abort a rotation, simply
-//! stop the tool; already-migrated rows remain openable with the new key, un-migrated rows remain
-//! openable with the old key. Rolling back a completed rotation requires running the tool again
-//! with the old and new keys swapped.
+//! Old-key and new-key records can coexist indefinitely: during the rotation window the server
+//! tries `MASTER_KEY_NEXT` first and falls back to `MASTER_KEY` (AES-GCM authentication tells
+//! them apart). To abort, stop the tool. Rolling back a completed rotation means running the tool
+//! again with the old and new keys swapped.
 //!
 //! ## Usage
 //!
@@ -48,17 +47,38 @@
 //! MASTER_KEY=<b64> \
 //!   cargo run -p octo-migrate-keys -- --batch-size 100
 //! ```
+//!
+//! ## Checkpoint (resuming an interrupted run)
+//!
+//! After every fully-processed batch the tool writes the last wallet id it handled to a
+//! checkpoint file, so a crash or Ctrl-C resumes from the last completed batch instead of
+//! re-scanning the whole table.
+//!
+//! - **Location:** `migrate-keys.checkpoint` in the working directory, or the path in
+//!   `MIGRATE_KEYS_CHECKPOINT`.
+//! - **Contents:** a fingerprint of the `(MASTER_KEY, MASTER_KEY_NEXT)` pair (a SHA-256 over
+//!   the keys — no key material) and the `after_id` cursor. A checkpoint written for a
+//!   different key pair is refused rather than silently skipping rows.
+//! - **Lifecycle:** removed automatically on clean completion.
+//! - **Forcing a full re-run:** stop the tool, then delete the file (`rm migrate-keys.checkpoint`).
+//!   This is always safe — the idempotency guard below makes re-scanned rows no-ops. Do not
+//!   hand-edit the cursor: moving it forward skips rows that were never migrated.
 
 #![forbid(unsafe_code)]
 
 use anyhow::{Context, Result};
 use base64::Engine;
-use octo_crypto::{master_key_from_slice, reseal, MASTER_KEY_LEN, SCHEME_V1};
+use octo_crypto::{master_key_from_slice, reseal_with_account_id, MASTER_KEY_LEN, SCHEME_V2};
 use octo_store::Store;
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 /// Maximum rows per batch (hard cap, configurable via CLI).
 const DEFAULT_BATCH_SIZE: i64 = 100;
+
+/// Checkpoint file used when `MIGRATE_KEYS_CHECKPOINT` is unset.
+const DEFAULT_CHECKPOINT_PATH: &str = "migrate-keys.checkpoint";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -78,13 +98,26 @@ async fn main() -> Result<()> {
         .context("connect to database")?;
     store.migrate().await.context("run migrations")?;
 
-    let mut after_id: Option<Uuid> = None;
+    let fingerprint = key_pair_fingerprint(&cfg.old_key, &cfg.new_key);
+    let mut after_id = read_checkpoint(&cfg.checkpoint_path, &fingerprint)?;
+    match after_id {
+        Some(id) => tracing::info!(
+            checkpoint = %cfg.checkpoint_path.display(),
+            after_id = %id,
+            "resuming from checkpoint"
+        ),
+        None => tracing::info!(
+            checkpoint = %cfg.checkpoint_path.display(),
+            "no checkpoint found; starting from the beginning"
+        ),
+    }
+    let mut batches_completed = 0usize;
     let mut total_migrated = 0usize;
     let mut total_skipped = 0usize;
 
     loop {
         let batch = store
-            .list_wallets_needing_reseal(SCHEME_V1 as i16, cfg.batch_size, after_id)
+            .list_wallets_needing_reseal(SCHEME_V2 as i16, cfg.batch_size, after_id)
             .await
             .context("list_wallets_needing_reseal")?;
 
@@ -117,15 +150,25 @@ async fn main() -> Result<()> {
                 ciphertext.clone(),
                 nonce,
                 salt,
-                scheme as u8,
+                u8::try_from(scheme).context("sealed scheme must fit in an unsigned byte")?,
             )
             .with_context(|| format!("from_parts wallet {}", wallet.id))?;
 
             // Context is the network string bound into the AEAD AAD (e.g. "octo:mainnet").
             let context = format!("octo:{}", wallet.network);
+            let account_id = wallet
+                .gas_tank_account_g
+                .as_deref()
+                .unwrap_or(&wallet.stellar_account_g);
 
-            // reseal: open under old key → re-seal under new key (Zeroizing throughout).
-            let new_sealed = reseal(&cfg.old_key, &cfg.new_key, &sealed, context.as_bytes())
+            // Reseal into the account-bound scheme (Zeroizing throughout).
+            let new_sealed = reseal_with_account_id(
+                &cfg.old_key,
+                &cfg.new_key,
+                &sealed,
+                context.as_bytes(),
+                account_id,
+            )
                 .with_context(|| format!("reseal wallet {}", wallet.id))?;
 
             // Atomically swap the DB record. The idempotency guard (expected_old_scheme)
@@ -136,7 +179,7 @@ async fn main() -> Result<()> {
                     &new_sealed.ciphertext,
                     &new_sealed.nonce,
                     &new_sealed.salt,
-                    SCHEME_V1 as i16,
+                    SCHEME_V2 as i16,
                     scheme,
                 )
                 .await
@@ -151,16 +194,98 @@ async fn main() -> Result<()> {
             }
         }
 
-        // Advance the cursor to the last wallet in this batch (ids are ordered ASC).
+        // Advance the cursor to the last wallet in this batch (ids are ordered ASC), and persist
+        // it only now that every row in the batch is done, so a resume never skips a row.
         after_id = batch.last().map(|w| w.id);
+        if let Some(id) = after_id {
+            write_checkpoint(&cfg.checkpoint_path, &fingerprint, id)?;
+        }
+        batches_completed += 1;
+        tracing::info!(
+            batches_completed,
+            total_migrated,
+            total_skipped,
+            after_id = ?after_id,
+            "batch complete"
+        );
     }
 
+    remove_checkpoint(&cfg.checkpoint_path)?;
     tracing::info!(
+        batches_completed,
         total_migrated,
         total_skipped,
-        "migration complete — 0 wallets remaining on old scheme"
+        "migration complete — 0 wallets remaining on old scheme; checkpoint removed"
     );
     Ok(())
+}
+
+/// Identify the key pair a checkpoint belongs to without writing any key material to disk.
+fn key_pair_fingerprint(old_key: &[u8; MASTER_KEY_LEN], new_key: &[u8; MASTER_KEY_LEN]) -> String {
+    let mut h = Sha256::new();
+    h.update(b"octo-migrate-keys/checkpoint/v1");
+    h.update(old_key);
+    h.update(new_key);
+    hex::encode(h.finalize())
+}
+
+/// Read the resume cursor, refusing a malformed checkpoint or one from a different key pair.
+fn read_checkpoint(path: &Path, fingerprint: &str) -> Result<Option<Uuid>> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(e).with_context(|| format!("read checkpoint {}", path.display()));
+        }
+    };
+    let mut stored_fingerprint = None;
+    let mut stored_after_id = None;
+    for line in contents.lines() {
+        match line.split_once('=') {
+            Some(("fingerprint", v)) => stored_fingerprint = Some(v.trim()),
+            Some(("after_id", v)) => stored_after_id = Some(v.trim()),
+            _ => {}
+        }
+    }
+    let (Some(stored_fingerprint), Some(stored_after_id)) = (stored_fingerprint, stored_after_id)
+    else {
+        anyhow::bail!(
+            "checkpoint {} is malformed; delete it to restart from the beginning",
+            path.display()
+        );
+    };
+    if stored_fingerprint != fingerprint {
+        anyhow::bail!(
+            "checkpoint {} was written for a different MASTER_KEY/MASTER_KEY_NEXT pair; \
+             delete it to restart from the beginning",
+            path.display()
+        );
+    }
+    let id = Uuid::parse_str(stored_after_id).with_context(|| {
+        format!(
+            "checkpoint {} has an invalid after_id; delete it to restart from the beginning",
+            path.display()
+        )
+    })?;
+    Ok(Some(id))
+}
+
+/// Persist the cursor via write-then-rename so a crash mid-write never leaves a torn file.
+fn write_checkpoint(path: &Path, fingerprint: &str, after_id: Uuid) -> Result<()> {
+    let tmp = path.with_extension("checkpoint.tmp");
+    std::fs::write(&tmp, format!("fingerprint={fingerprint}\nafter_id={after_id}\n"))
+        .with_context(|| format!("write checkpoint {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("replace checkpoint {}", path.display()))
+}
+
+/// Delete the checkpoint after a clean run; a missing file is fine.
+fn remove_checkpoint(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(e).with_context(|| format!("remove checkpoint {}", path.display()))
+        }
+        _ => Ok(()),
+    }
 }
 
 struct Config {
@@ -168,6 +293,7 @@ struct Config {
     old_key: [u8; MASTER_KEY_LEN],
     new_key: [u8; MASTER_KEY_LEN],
     batch_size: i64,
+    checkpoint_path: PathBuf,
 }
 
 impl Config {
@@ -192,12 +318,21 @@ impl Config {
             .nth(1)
             .and_then(|v| v.parse::<i64>().ok())
             .unwrap_or(DEFAULT_BATCH_SIZE);
+        // LIMIT 0 returns an empty page, which the loop would misread as "migration complete".
+        if batch_size <= 0 {
+            anyhow::bail!("--batch-size must be a positive integer");
+        }
+
+        let checkpoint_path = std::env::var("MIGRATE_KEYS_CHECKPOINT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(DEFAULT_CHECKPOINT_PATH));
 
         Ok(Config {
             database_url,
             old_key,
             new_key,
             batch_size,
+            checkpoint_path,
         })
     }
 }

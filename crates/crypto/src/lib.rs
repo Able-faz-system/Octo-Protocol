@@ -57,6 +57,8 @@ pub const SALT_LEN: usize = 32;
 /// The current sealing scheme: AES-256-GCM with per-record HKDF-SHA256 subkey derivation and
 /// context-bound AAD. All new seals are produced with this scheme tag.
 pub const SCHEME_V1: u8 = 1;
+/// AES-256-GCM with the network context and owning account id bound into the AAD.
+pub const SCHEME_V2: u8 = 2;
 
 /// A sealed secret: the AES-256-GCM ciphertext (including the authentication tag) plus the
 /// public, non-secret `nonce` and `salt` needed to open it, and an explicit `scheme` version tag
@@ -104,6 +106,10 @@ impl SealedSeed {
         salt: &[u8],
         scheme: u8,
     ) -> Result<SealedSeed, CryptoError> {
+        match scheme {
+            SCHEME_V1 | SCHEME_V2 => {}
+            _ => return Err(CryptoError::UnknownScheme(scheme)),
+        }
         let nonce: [u8; NONCE_LEN] = nonce
             .try_into()
             .map_err(|_| CryptoError::InvalidNonceLength)?;
@@ -143,6 +149,7 @@ fn derive_subkey(
 /// (e.g. `b"octo:mainnet"`). A fresh random nonce and salt are generated per call, so sealing the
 /// same plaintext twice yields different output. The returned [`SealedSeed`] always has
 /// `scheme = `[`SCHEME_V1`].
+/// Nonce and salt bytes come from `OsRng`, the operating system's cryptographically secure RNG.
 pub fn seal(
     master_key: &[u8; MASTER_KEY_LEN],
     plaintext: &[u8],
@@ -175,6 +182,24 @@ pub fn seal(
     })
 }
 
+/// Seal a secret while binding its owning Stellar account id into the authenticated context.
+pub fn seal_with_account_id(
+    master_key: &[u8; MASTER_KEY_LEN],
+    plaintext: &[u8],
+    context: &[u8],
+    account_id: &str,
+) -> Result<SealedSeed, CryptoError> {
+    if account_id.is_empty() {
+        return Err(CryptoError::AccountIdentityRequired);
+    }
+    let mut bound_context = context.to_vec();
+    bound_context.push(0);
+    bound_context.extend_from_slice(account_id.as_bytes());
+    let mut sealed = seal(master_key, plaintext, &bound_context)?;
+    sealed.scheme = SCHEME_V2;
+    Ok(sealed)
+}
+
 /// Authenticated-decrypt a [`SealedSeed`] produced by [`seal`].
 ///
 /// Returns the plaintext wrapped in [`Zeroizing`] so it is wiped when dropped. Fails with
@@ -190,6 +215,7 @@ pub fn open(
     // Validate the scheme tag before attempting any cryptographic operation.
     match sealed.scheme {
         SCHEME_V1 => {} // the only supported scheme
+        SCHEME_V2 => return Err(CryptoError::AccountIdentityRequired),
         _ => return Err(CryptoError::UnknownScheme(sealed.scheme)),
     }
 
@@ -214,25 +240,117 @@ pub fn open(
     Ok(Zeroizing::new(plaintext))
 }
 
+/// Open a V2 secret using the expected owning Stellar account id.
+pub fn open_with_account_id(
+    master_key: &[u8; MASTER_KEY_LEN],
+    sealed: &SealedSeed,
+    context: &[u8],
+    account_id: &str,
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+    if sealed.scheme != SCHEME_V2 {
+        return open(master_key, sealed, context);
+    }
+    if account_id.is_empty() {
+        return Err(CryptoError::AccountIdentityRequired);
+    }
+    let mut bound_context = context.to_vec();
+    bound_context.push(0);
+    bound_context.extend_from_slice(account_id.as_bytes());
+    let mut v1 = sealed.clone();
+    v1.scheme = SCHEME_V1;
+    open(master_key, &v1, &bound_context)
+}
+
 /// Rotate the master key protecting an already-sealed secret.
 ///
 /// Opens `sealed` under `old_key`/`context`, then seals the recovered plaintext under `new_key`
 /// and the same `context`. The intermediate plaintext is wrapped in [`Zeroizing`] (as returned by
 /// [`open`]) and wiped on drop. The returned [`SealedSeed`] gets a fresh random nonce and salt, as
 /// [`seal`] always generates — it never reuses the original record's.
+///
+/// `reseal` is the one place a legacy `scheme = 0` record is accepted: `0` names the same
+/// algorithm as [`SCHEME_V1`], so it is opened as V1 and re-sealed with an explicit V1 tag.
 pub fn reseal(
     old_key: &[u8; MASTER_KEY_LEN],
     new_key: &[u8; MASTER_KEY_LEN],
     sealed: &SealedSeed,
     context: &[u8],
 ) -> Result<SealedSeed, CryptoError> {
-    let plaintext = open(old_key, sealed, context)?;
+    let plaintext = if sealed.scheme == 0 {
+        let as_v1 = SealedSeed {
+            scheme: SCHEME_V1,
+            ..sealed.clone()
+        };
+        open(old_key, &as_v1, context)?
+    } else {
+        open(old_key, sealed, context)?
+    };
     seal(new_key, plaintext.as_ref(), context)
+}
+
+/// Rotate a sealed secret into the account-bound V2 scheme.
+pub fn reseal_with_account_id(
+    old_key: &[u8; MASTER_KEY_LEN],
+    new_key: &[u8; MASTER_KEY_LEN],
+    sealed: &SealedSeed,
+    context: &[u8],
+    account_id: &str,
+) -> Result<SealedSeed, CryptoError> {
+    let plaintext = open_with_account_id(old_key, sealed, context, account_id)?;
+    seal_with_account_id(new_key, plaintext.as_ref(), context, account_id)
+}
+
+/// Domain separator for the self-test canary, so it can never be confused with a real record.
+const SELF_TEST_CONTEXT: &[u8] = b"octo:self-test";
+/// Length of the random canary sealed by [`self_test`].
+const CANARY_LEN: usize = 32;
+
+/// Boot-time check that the OS entropy source and the seal/open round-trip work under
+/// `master_key`, so a broken RNG or degenerate key fails at startup rather than at first use.
+///
+/// Rejects an all-zero key, draws two random canaries (a stuck RNG would repeat), seals one,
+/// opens it, and confirms a foreign context is rejected. Canaries are zeroized on drop.
+pub fn self_test(master_key: &[u8; MASTER_KEY_LEN]) -> Result<(), CryptoError> {
+    if master_key.iter().all(|b| *b == 0) {
+        return Err(CryptoError::SelfTestFailed("master key is all zero bytes"));
+    }
+
+    let mut canary = Zeroizing::new([0u8; CANARY_LEN]);
+    let mut probe = Zeroizing::new([0u8; CANARY_LEN]);
+    OsRng
+        .try_fill_bytes(canary.as_mut())
+        .and_then(|()| OsRng.try_fill_bytes(probe.as_mut()))
+        .map_err(|_| CryptoError::SelfTestFailed("entropy source unavailable"))?;
+    // Two independent 256-bit draws are equal or all-zero only if the RNG is broken.
+    if *canary == *probe || canary.iter().all(|b| *b == 0) {
+        return Err(CryptoError::SelfTestFailed("entropy source returned degenerate output"));
+    }
+
+    let sealed = seal(master_key, canary.as_ref(), SELF_TEST_CONTEXT)
+        .map_err(|_| CryptoError::SelfTestFailed("seal failed"))?;
+    if sealed.ciphertext.get(..CANARY_LEN) == Some(canary.as_slice()) {
+        return Err(CryptoError::SelfTestFailed("ciphertext equals plaintext"));
+    }
+
+    let opened = open(master_key, &sealed, SELF_TEST_CONTEXT)
+        .map_err(|_| CryptoError::SelfTestFailed("open failed"))?;
+    if opened.as_slice() != canary.as_slice() {
+        return Err(CryptoError::SelfTestFailed("round-trip mismatch"));
+    }
+
+    // AEAD must authenticate the context; a foreign one opening would mean AAD is ignored.
+    if open(master_key, &sealed, b"octo:self-test:foreign").is_ok() {
+        return Err(CryptoError::SelfTestFailed("foreign context was accepted"));
+    }
+    Ok(())
 }
 
 /// Convenience: parse a 32-byte master key from a byte slice (e.g. decoded from a KMS/env value).
 pub fn master_key_from_slice(bytes: &[u8]) -> Result<[u8; MASTER_KEY_LEN], CryptoError> {
-    bytes.try_into().map_err(|_| CryptoError::InvalidKeyLength)
+    bytes.try_into().map_err(|_| CryptoError::InvalidMasterKeyLength {
+        expected: MASTER_KEY_LEN,
+        actual: bytes.len(),
+    })
 }
 
 #[cfg(test)]
@@ -267,6 +385,45 @@ mod tests {
     }
 
     #[test]
+    fn account_bound_v2_rejects_the_wrong_account_id() {
+        let mk = key();
+        let sealed = seal_with_account_id(&mk, b"seed", CTX, "GGOOD").unwrap();
+        assert!(matches!(
+            open_with_account_id(&mk, &sealed, CTX, "GBAD"),
+            Err(CryptoError::DecryptionFailed)
+        ));
+    }
+
+    #[test]
+    fn v1_rows_still_open_with_the_original_context() {
+        let mk = key();
+        let sealed = seal(&mk, b"seed", CTX).unwrap();
+        assert_eq!(open(&mk, &sealed, CTX).unwrap().as_slice(), b"seed");
+    }
+
+    #[test]
+    fn reseal_migrates_v1_to_account_bound_v2() {
+        let old_mk = key();
+        let new_mk = key();
+        let sealed = seal(&old_mk, b"seed", CTX).unwrap();
+        let migrated = reseal_with_account_id(
+            &old_mk,
+            &new_mk,
+            &sealed,
+            CTX,
+            "GACCOUNT",
+        )
+        .unwrap();
+        assert_eq!(migrated.scheme, SCHEME_V2);
+        assert_eq!(
+            open_with_account_id(&new_mk, &migrated, CTX, "GACCOUNT")
+                .unwrap()
+                .as_slice(),
+            b"seed"
+        );
+    }
+
+    #[test]
     fn ciphertext_is_not_plaintext() {
         let mk = key();
         let secret = b"super secret seed";
@@ -289,6 +446,79 @@ mod tests {
         // Both still open to the same plaintext.
         assert_eq!(open(&mk, &a, CTX).unwrap().as_slice(), secret);
         assert_eq!(open(&mk, &b, CTX).unwrap().as_slice(), secret);
+    }
+
+    #[test]
+    fn nonce_is_never_reused_across_many_seals_of_identical_plaintext() {
+        let mk = key();
+        let secret = b"identical plaintext";
+        let mut nonces = std::collections::HashSet::with_capacity(10_000);
+
+        for _ in 0..10_000 {
+            let sealed = seal(&mk, secret, CTX).unwrap();
+            assert!(nonces.insert(sealed.nonce), "nonce reused across seal calls");
+        }
+    }
+        }
+    }
+
+    #[test]
+    fn nonce_is_never_reused_across_many_seals_of_identical_plaintext() {
+        let mk = key();
+        let secret = b"identical plaintext";
+        let mut nonces = std::collections::HashSet::with_capacity(10_000);
+
+        for _ in 0..10_000 {
+            let sealed = seal(&mk, secret, CTX).unwrap();
+            assert!(nonces.insert(sealed.nonce), "nonce reused across seal calls");
+        }
+    }
+
+    #[test]
+    fn nonces_show_no_correlation_with_varying_plaintext_and_key_across_a_large_sample() {
+        const SAMPLE_SIZE: usize = 10_000;
+        let mut nonces = std::collections::HashSet::with_capacity(SAMPLE_SIZE);
+        let mut sum_n: f64 = 0.0;
+        let mut sum_k: f64 = 0.0;
+        let mut sum_p: f64 = 0.0;
+        let mut sum_nk: f64 = 0.0;
+        let mut sum_np: f64 = 0.0;
+        let mut sum_n_sq: f64 = 0.0;
+        let mut sum_k_sq: f64 = 0.0;
+        let mut sum_p_sq: f64 = 0.0;
+
+        for _ in 0..SAMPLE_SIZE {
+            let mut mk = [0u8; MASTER_KEY_LEN];
+            let mut pt = [0u8; 32];
+            OsRng.fill_bytes(&mut mk);
+            OsRng.fill_bytes(&mut pt);
+
+            let sealed = seal(&mk, &pt, CTX).unwrap();
+            assert!(nonces.insert(sealed.nonce), "nonce collision detected in varied sample");
+
+            let n_val = sealed.nonce[0] as f64;
+            let k_val = mk[0] as f64;
+            let p_val = pt[0] as f64;
+
+            sum_n += n_val;
+            sum_k += k_val;
+            sum_p += p_val;
+            sum_nk += n_val * k_val;
+            sum_np += n_val * p_val;
+            sum_n_sq += n_val * n_val;
+            sum_k_sq += k_val * k_val;
+            sum_p_sq += p_val * p_val;
+        }
+
+        let n = SAMPLE_SIZE as f64;
+        let r_key = (n * sum_nk - sum_n * sum_k)
+            / (((n * sum_n_sq - sum_n * sum_n) * (n * sum_k_sq - sum_k * sum_k)).sqrt());
+        let r_pt = (n * sum_np - sum_n * sum_p)
+            / (((n * sum_n_sq - sum_n * sum_n) * (n * sum_p_sq - sum_p * sum_p)).sqrt());
+
+        // Pearson correlation between nonce and input bytes must be negligible (< 0.05).
+        assert!(r_key.abs() < 0.05, "correlation detected between nonce and key: {r_key}");
+        assert!(r_pt.abs() < 0.05, "correlation detected between nonce and plaintext: {r_pt}");
     }
 
     #[test]
@@ -384,6 +614,20 @@ mod tests {
     }
 
     #[test]
+    fn reseal_upgrades_a_legacy_scheme_0_record_to_v1() {
+        let (old_mk, new_mk) = (key(), key());
+        let mut legacy = seal(&old_mk, b"legacy seed", CTX).unwrap();
+        legacy.scheme = 0;
+        assert!(open(&old_mk, &legacy, CTX).is_err());
+        let resealed = reseal(&old_mk, &new_mk, &legacy, CTX).unwrap();
+        assert_eq!(resealed.scheme, SCHEME_V1);
+        assert_eq!(
+            open(&new_mk, &resealed, CTX).unwrap().as_slice(),
+            b"legacy seed"
+        );
+    }
+
+    #[test]
     fn reseal_fails_cleanly_if_old_key_or_context_is_wrong() {
         let old_mk = key();
         let new_mk = key();
@@ -405,12 +649,24 @@ mod tests {
         assert!(master_key_from_slice(&[0u8; 32]).is_ok());
         assert!(matches!(
             master_key_from_slice(&[0u8; 31]),
-            Err(CryptoError::InvalidKeyLength)
+            Err(CryptoError::InvalidMasterKeyLength { .. })
         ));
         assert!(matches!(
             master_key_from_slice(&[0u8; 33]),
-            Err(CryptoError::InvalidKeyLength)
+            Err(CryptoError::InvalidMasterKeyLength { .. })
         ));
+    }
+
+    #[test]
+    fn from_parts_with_scheme_rejects_unknown_scheme() {
+        let error = SealedSeed::from_parts_with_scheme(
+            vec![0u8; 16],
+            &[0u8; NONCE_LEN],
+            &[0u8; SALT_LEN],
+            255,
+        )
+        .unwrap_err();
+        assert!(matches!(error, CryptoError::UnknownScheme(255)));
     }
 
     // ---------------------------------------------------------------------------

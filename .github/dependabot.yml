@@ -1,0 +1,102 @@
+# Weekly grouped dependency updates. Crypto crates get their own PR so CODEOWNERS review is
+# focused, and their breaking bumps are held back for a manual, reviewed upgrade.
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    labels: [dependencies, rust]
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      # Key handling, signing, sealing and RNG: anything a bug in would put funds at risk.
+      crypto:
+        patterns:
+          - aes-gcm
+          - argon2
+          - curve25519-dalek
+          - ed25519-dalek
+          - getrandom
+          - hkdf
+          - hmac
+          - rand
+          - rand_core
+          - sha2
+          - slip10_ed25519
+          - stellar-base
+          - stellar-strkey
+          - subtle
+          - tiny-bip39
+          - zeroize
+      cargo:
+        patterns: ["*"]
+        # Keep in sync with the crypto group above.
+        exclude-patterns:
+          - aes-gcm
+          - argon2
+          - curve25519-dalek
+          - ed25519-dalek
+          - getrandom
+          - hkdf
+          - hmac
+          - rand
+          - rand_core
+          - sha2
+          - slip10_ed25519
+          - stellar-base
+          - stellar-strkey
+          - subtle
+          - tiny-bip39
+          - zeroize
+    # Cargo treats a 0.x minor bump as breaking, and most of these are 0.x, so hold both.
+    # Upgrade them by hand and re-audit derive.rs / octo-crypto (see Cargo.toml comments).
+    ignore:
+      - dependency-name: aes-gcm
+        update-types: [version-update:semver-major, version-update:semver-minor]
+      - dependency-name: argon2
+        update-types: [version-update:semver-major, version-update:semver-minor]
+      - dependency-name: curve25519-dalek
+        update-types: [version-update:semver-major]
+      - dependency-name: ed25519-dalek
+        update-types: [version-update:semver-major]
+      - dependency-name: getrandom
+        update-types: [version-update:semver-major, version-update:semver-minor]
+      - dependency-name: hkdf
+        update-types: [version-update:semver-major, version-update:semver-minor]
+      - dependency-name: hmac
+        update-types: [version-update:semver-major, version-update:semver-minor]
+      - dependency-name: rand
+        update-types: [version-update:semver-major, version-update:semver-minor]
+      - dependency-name: rand_core
+        update-types: [version-update:semver-major, version-update:semver-minor]
+      - dependency-name: sha2
+        update-types: [version-update:semver-major, version-update:semver-minor]
+      - dependency-name: slip10_ed25519
+        update-types: [version-update:semver-major, version-update:semver-minor]
+      - dependency-name: stellar-base
+        update-types: [version-update:semver-major, version-update:semver-minor]
+      - dependency-name: stellar-strkey
+        update-types: [version-update:semver-major, version-update:semver-minor]
+      - dependency-name: subtle
+        update-types: [version-update:semver-major]
+      - dependency-name: tiny-bip39
+        update-types: [version-update:semver-major]
+      - dependency-name: zeroize
+        update-types: [version-update:semver-major]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    labels: [dependencies, ci]
+    commit-message:
+      prefix: "ci(deps)"
+    # Dependabot bumps SHA pins and rewrites their `# vX.Y.Z` comments together.
+    groups:
+      actions:
+        patterns: ["*"]

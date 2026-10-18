@@ -1,6 +1,6 @@
 //! Sponsored transaction endpoints: sponsor a fee-bump, and list history.
 
-use crate::auth::authorize_wallet;
+use crate::auth::authorize_wallet_scope;
 use crate::error::{ApiError, ApiResult, Envelope};
 use crate::json::parse_optional;
 use crate::sponsor_validation::validate_inner_xdr;
@@ -10,7 +10,10 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use octo_crypto::SealedSeed;
-use octo_wallet_core::{compute_inner_tx_hash, sign_fee_bump, FeeBumpRequest};
+use octo_wallet_core::{
+    compute_inner_tx_hash, inner_sequence_number, sign_fee_bump, sign_fee_bump_with_account_id, FeeBumpRequest,
+};
+use stellar_base::transaction::MIN_BASE_FEE;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -39,7 +42,7 @@ pub async fn sponsor(
     body: Bytes,
 ) -> ApiResult<(StatusCode, Json<Envelope<SponsorResponse>>)> {
     // Login JWT or API key, scoped to this wallet.
-    authorize_wallet(&headers, &state, wallet_id).await?;
+    authorize_wallet_scope(&headers, &state, wallet_id, "sponsor").await?;
 
     let req: SponsorRequest = parse_optional(&body)?;
     let inner_xdr = req
@@ -50,8 +53,17 @@ pub async fn sponsor(
         .max_base_fee_stroops
         .filter(|f| *f > 0)
         .ok_or_else(|| ApiError::BadRequest("max_base_fee_stroops must be > 0".into()))?;
+    if max_fee < MIN_BASE_FEE.to_i64() {
+        return Err(ApiError::BadRequest(format!(
+            "max_base_fee_stroops must be at least {}",
+            MIN_BASE_FEE.to_i64()
+        )));
+    }
 
     let wallet = state.store().get_wallet(wallet_id).await?;
+    if wallet.is_archived() {
+        return Err(ApiError::Forbidden("wallet is archived".into()));
+    }
 
     // 1. Sponsorship must be enabled for this wallet.
     let config = state
@@ -79,6 +91,25 @@ pub async fn sponsor(
 
     // 3. Validate the inner XDR (op allowlist + no self-sponsorship). Pure, no I/O.
     validate_inner_xdr(&inner_xdr, &wallet.stellar_account_g)?;
+
+    // Pre-flight sequence check to save a wasted budget reservation and signature on a doomed submission.
+    let live_seq = state
+        .horizon()
+        .account_sequence(&wallet.stellar_account_g)
+        .await
+        .map_err(|e| match e {
+            ApiError::NotFound => ApiError::BadRequest(
+                "This wallet is not funded on-chain yet. Fund it with XLM (testnet friendbot) first."
+                    .into(),
+            ),
+            other => other,
+        })?;
+    let inner_seq = inner_sequence_number(&inner_xdr)?;
+    if inner_seq <= live_seq {
+        return Err(ApiError::StaleSequence(
+            "Stale sequence number — refresh signing info and rebuild the transaction.".into(),
+        ));
+    }
 
     // 4. Compute the inner tx hash (dedup key) and reserve budget atomically.
     let inner_hash = compute_inner_tx_hash(&inner_xdr, state.network())?;
@@ -112,26 +143,24 @@ pub async fn sponsor(
                 .into(),
         ));
     };
-    // Keep the versioned-scheme path (PR #158) so master-key rotation keeps working. Rows
-    // written before the scheme tag existed fall back to V1.
+    // Rows written before the scheme tag existed fall back to V1.
     let scheme = wallet
         .sealed_scheme
         .unwrap_or(octo_crypto::SCHEME_V1 as i16);
-    let sealed = SealedSeed::from_parts_with_scheme(ciphertext.clone(), nonce, salt, scheme as u8)
+    let scheme_byte = u8::try_from(scheme).map_err(|_| ApiError::Internal)?;
+    let sealed = SealedSeed::from_parts_with_scheme(ciphertext.clone(), nonce, salt, scheme_byte)
         .map_err(|_| ApiError::Internal)?;
     let fb = FeeBumpRequest {
         inner_xdr: &inner_xdr,
         max_base_fee_stroops: max_fee,
     };
-    let signed = match sign_fee_bump(
-        state.master_key_for_scheme(scheme),
-        &sealed,
-        state.network(),
-        0,
-        &fb,
-    ) {
-        Ok(s) => s,
-        Err(_) => {
+    // During a rotation the row may be sealed under either key; AES-GCM tells us which.
+    let signed = match state
+        .opening_keys()
+        .find_map(|key| sign_fee_bump(key, &sealed, state.network(), 0, &fb).ok())
+    {
+        Some(s) => s,
+        None => {
             let _ = state
                 .store()
                 .finalize_sponsored_transaction(reserved.id, "failed", None, Some("signing failed"))

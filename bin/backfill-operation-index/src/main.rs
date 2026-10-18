@@ -336,31 +336,17 @@ mod tests {
 
     #[test]
     fn operation_index_from_toid_parses_correctly() {
-        assert_eq!(operation_index_from_toid("12345-1-0"), Some(0));
-        assert_eq!(operation_index_from_toid("12345-1-1"), Some(1));
-        assert_eq!(operation_index_from_toid("12345-10-5"), Some(5));
-        assert_eq!(operation_index_from_toid("999999999-0-99"), Some(99));
+        assert_eq!(operation_index_from_toid("12884905985"), Some(0));
+        assert_eq!(operation_index_from_toid("12884905986"), Some(1));
+        assert_eq!(operation_index_from_toid("53021371310086"), Some(5));
+        assert_eq!(operation_index_from_toid("4294963001036900"), Some(99));
     }
 
     #[test]
     fn operation_index_from_toid_handles_invalid_format() {
-        assert_eq!(operation_index_from_toid("12345-1"), None);
-        assert_eq!(operation_index_from_toid("12345"), None);
         assert_eq!(operation_index_from_toid(""), None);
-        assert_eq!(operation_index_from_toid("12345-1-0-extra"), None);
-        assert_eq!(operation_index_from_toid("12345-1-abc"), None);
-    }
-
-    #[test]
-    fn operation_index_from_toid_handles_edge_cases() {
-        // A real Horizon TOID's operation index is never negative, and a literal "-1" segment
-        // splits the string into 4 hyphen-delimited parts (not 3), so this is correctly rejected
-        // by the same "exactly 3 parts" check that rejects any other malformed TOID shape.
-        assert_eq!(operation_index_from_toid("12345-1--1"), None);
-        assert_eq!(
-            operation_index_from_toid("12345-1-2147483647"),
-            Some(i32::MAX)
-        );
-        assert_eq!(operation_index_from_toid("12345-1-2147483648"), None);
+        assert_eq!(operation_index_from_toid("12345-1-0"), None);
+        assert_eq!(operation_index_from_toid("abc"), None);
+        assert_eq!(operation_index_from_toid("12884905984"), None);
     }
 }

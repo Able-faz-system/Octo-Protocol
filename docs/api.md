@@ -50,7 +50,9 @@ decrypt. Consequently:
 - `GET  /v1/wallets/{id}/balances` — live on-chain balances.
 - `GET  /v1/wallets/{id}/transactions` — deposits + outbound transfers (paginated).
 - `GET  /v1/wallets/{id}/backup` — the opaque client-encrypted backup blob, for new-device
-  recovery. **Dashboard JWT only.** Useless without the user's password.
+  recovery. **Dashboard JWT only.** Useless without the user's password. Rate-limited to 5
+  requests per hour per user (`429` beyond that); every successful read writes an audit row, and
+  the request fails with `500` rather than return the blob if that row can't be written.
 
 ## Moving funds (the non-custodial path)
 
@@ -119,3 +121,25 @@ so it cannot escalate or revoke itself.
 - **Amounts** are integer **stroops** (1 XLM = 10,000,000) end-to-end — never floats.
 - **Errors** map to `400` (validation), `401`, `403`, `404`, `409` (conflict), `410` (removed
   custodial endpoints), `413` (body over 64 KiB), `429` (budget exceeded). There is no `422`.
+
+## Rate Limits
+
+The API enforces fixed-window rate limiting on unauthenticated and authentication endpoints to protect against brute-force and resource-exhaustion attacks. When a rate limit is exceeded, the server responds with HTTP `429 Too Many Requests`.
+
+| Endpoint | Method | Key Scope | Limit | Window | Code Constant |
+|---|---|---|---|---|---|
+| `/v1/auth/signup` | POST | Per-IP | 10 req | 60s (1m) | `AUTH_RATE_LIMIT` / `AUTH_RATE_WINDOW` |
+| `/v1/auth/verify-email` | POST | Per-IP | 10 req | 60s (1m) | `AUTH_RATE_LIMIT` / `AUTH_RATE_WINDOW` |
+| `/v1/auth/login` | POST | Per-IP | 10 req | 60s (1m) | `AUTH_RATE_LIMIT` / `AUTH_RATE_WINDOW` |
+| `/v1/auth/refresh` | POST | Per-IP | 10 req | 60s (1m) | `AUTH_RATE_LIMIT` / `AUTH_RATE_WINDOW` |
+| `/v1/auth/resend-otp` | POST | Per-IP | 10 req | 60s (1m) | `AUTH_RATE_LIMIT` / `AUTH_RATE_WINDOW` |
+| `/v1/auth/resend-otp` | POST | Per-User (`otp:{user_id}`) | 3 req | 3600s (1h) | `OTP_RESEND_USER_LIMIT` / `OTP_RESEND_USER_WINDOW` |
+| `/v1/auth/resend-otp` | POST | Per-IP | 10 req | 3600s (1h) | `OTP_RESEND_IP_LIMIT` / `OTP_RESEND_IP_WINDOW` |
+| `/v1/pay/:slug` | GET | Per-IP | 60 req | 60s (1m) | `PAY_READ_LIMIT` / `PAY_READ_WINDOW` |
+| `/v1/pay/:slug/intent` | POST | Per-IP | 5 req | 60s (1m) | `PAY_INTENT_LIMIT` / `PAY_INTENT_WINDOW` |
+| `/v1/pay/:slug/payments/:payment_id` | GET | Per-IP | 60 req | 60s (1m) | `PAY_STATUS_LIMIT` / `PAY_STATUS_WINDOW` |
+| `/v1/pay/:slug/signing-info` | GET | Per-IP | 60 req | 60s (1m) | `PAY_SIGNING_INFO_LIMIT` / `PAY_SIGNING_INFO_WINDOW` |
+| `/v1/pay/:slug/submit-signed` | POST | Per-IP | 20 req | 60s (1m) | `PAY_SUBMIT_LIMIT` / `PAY_SUBMIT_WINDOW` |
+
+> [!NOTE]
+> **Process Note:** Any new rate limit added to the API must update this table and reference named constants in `crates/api/src/rate_limit.rs` within the same pull request.

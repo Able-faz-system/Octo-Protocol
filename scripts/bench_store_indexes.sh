@@ -160,6 +160,23 @@ WHERE user_id = :'hot_user'
 ORDER BY created_at DESC
 LIMIT 25;
 
+\echo '=== wallets_due_for_poll (ingest supervisor tick) ==='
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT w.* FROM wallets w
+LEFT JOIN ingest_cursor c ON c.wallet_id = w.id
+WHERE w.network = 'testnet'
+  AND (
+    c.last_polled_at IS NULL
+    OR c.updated_at IS NULL
+    OR c.last_polled_at < now() - make_interval(secs =>
+         CASE
+           WHEN c.updated_at > now() - make_interval(secs => 60.0) THEN 0
+           WHEN c.updated_at <= now() - make_interval(secs => 300.0) THEN 100000.0
+           ELSE 100.0
+         END)
+  )
+ORDER BY w.created_at;
+
 -- EXPLAIN ANALYZE actually executes INSERTs, so wrap each probe in its own rolled-back
 -- transaction — the seeded data (and the row count the other queries above measured against)
 -- must be left untouched.

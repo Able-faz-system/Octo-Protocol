@@ -9,6 +9,9 @@ const DECIMALS: usize = 7;
 
 /// Parse a Stellar decimal amount string into stroops. Returns `None` on malformed input or
 /// overflow. Rejects negative and non-positive results (caller treats those as invalid).
+///
+/// More than 7 fractional digits is rejected, never truncated: sub-stroop precision can't be
+/// represented, and rounding it away would credit a silently different amount.
 pub fn to_stroops(amount: &str) -> Option<i64> {
     let amount = amount.trim();
     if amount.is_empty() || amount.starts_with('-') {
@@ -22,6 +25,7 @@ pub fn to_stroops(amount: &str) -> Option<i64> {
 
     if !int_part.chars().all(|c| c.is_ascii_digit())
         || !frac_part.chars().all(|c| c.is_ascii_digit())
+        // Sub-stroop precision: reject rather than truncate.
         || frac_part.len() > DECIMALS
     {
         return None;
@@ -94,5 +98,25 @@ mod tests {
     #[test]
     fn leading_plus_sign_behavior_is_locked_in() {
         assert_eq!(to_stroops("+1.0000000"), None);
+    }
+
+    #[test]
+    fn to_stroops_rejects_more_than_seven_fractional_digits() {
+        assert_eq!(to_stroops("1.00000001"), None);
+        assert_eq!(to_stroops("0.00000009"), None);
+        // Trailing zeros still exceed native precision; the record is malformed, not rounded.
+        assert_eq!(to_stroops("1.00000000"), None);
+    }
+
+    #[test]
+    fn to_stroops_accepts_exactly_seven_fractional_digits() {
+        assert_eq!(to_stroops("1.2345678"), Some(12_345_678));
+        assert_eq!(to_stroops("0.9999999"), Some(9_999_999));
+    }
+
+    #[test]
+    fn to_stroops_still_accepts_whole_number_amounts() {
+        assert_eq!(to_stroops("0"), Some(0));
+        assert_eq!(to_stroops("42"), Some(420_000_000));
     }
 }

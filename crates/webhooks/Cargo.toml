@@ -9,6 +9,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+octo-resilience.workspace = true
 octo-store.workspace = true
 reqwest.workspace = true
 hmac.workspace = true
@@ -24,4 +25,5 @@ uuid.workspace = true
 [dev-dependencies]
 axum.workspace = true
 chrono.workspace = true
+dotenvy = "0.15"
 

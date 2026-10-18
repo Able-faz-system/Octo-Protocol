@@ -20,6 +20,9 @@ stellar-strkey.workspace = true
 stellar-base.workspace = true
 slip10_ed25519.workspace = true
 tiny-bip39.workspace = true
+# SECURITY: WalletSeed::generate draws mnemonic entropy from rand::rngs::OsRng explicitly (not
+# tiny-bip39's thread_rng default). Re-audit derive.rs if this dependency or rand is bumped.
+rand.workspace = true
 ed25519-dalek.workspace = true
 zeroize.workspace = true
 thiserror.workspace = true

@@ -80,7 +80,7 @@ struct RouteCase {
 
 /// Every mutating route under `crates/api/src/routes/` (plus dashboard auth) that parses its body
 /// via `crate::json::parse_optional`. Deliberately excludes routes with no body (e.g.
-/// `POST /v1/wallets/:id/api-key`, `DELETE .../api-key`) — there's no JSON shape to be malformed.
+/// `DELETE /v1/wallets/:id/api-key`) — there's no JSON shape to be malformed.
 /// Also excludes `POST /v1/wallets/:id/withdraw`: it's a `410 Gone` tombstone (see
 /// `custodial_withdraw_is_gone` in `api_tests.rs`) that never reaches `parse_optional`.
 const MUTATING_ROUTES: &[RouteCase] = &[
@@ -117,6 +117,11 @@ const MUTATING_ROUTES: &[RouteCase] = &[
     RouteCase {
         method: "POST",
         path_template: "/v1/wallets/{wallet}/sponsor",
+        needs_auth: true,
+    },
+    RouteCase {
+        method: "POST",
+        path_template: "/v1/wallets/{wallet}/api-key",
         needs_auth: true,
     },
 ];

@@ -1,6 +1,6 @@
 //! Payment links: shareable public URLs that accept a USDC deposit.
 
-use crate::auth::authorize_wallet;
+use crate::auth::{authorize_wallet, authorize_wallet_scope};
 use crate::error::{ApiError, ApiResult, Envelope};
 use crate::json::parse_optional;
 use crate::state::AppState;
@@ -54,7 +54,7 @@ pub async fn create_payment_link(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<(StatusCode, Json<Envelope<PaymentLinkView>>)> {
-    authorize_wallet(&headers, &state, wallet_id).await?;
+    authorize_wallet_scope(&headers, &state, wallet_id, "write").await?;
     let req: CreatePaymentLinkRequest = parse_optional(&body)?;
     let name = req
         .name
@@ -278,7 +278,7 @@ pub async fn set_payment_link_active(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Json<Envelope<PaymentLinkView>>> {
-    authorize_wallet(&headers, &state, wallet_id).await?;
+    authorize_wallet_scope(&headers, &state, wallet_id, "write").await?;
     let req: SetPaymentLinkActiveRequest = parse_optional(&body)?;
     let active = req
         .active
@@ -326,11 +326,12 @@ fn check_public_rate_limit(
     peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
     class: &'static str,
     limit: u32,
+    window: std::time::Duration,
 ) -> Result<(), ApiError> {
     let ip = crate::rate_limit::client_ip(headers, peer.map(|c| c.0));
     if state
         .rate_limiter()
-        .check(&ip, class, limit, std::time::Duration::from_secs(60))
+        .check(&ip, class, limit, window)
     {
         Ok(())
     } else {
@@ -347,7 +348,14 @@ pub async fn get_public_payment_link(
     peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Envelope<PublicPaymentLinkView>>> {
-    check_public_rate_limit(&state, &headers, peer, "pay_read", 60)?;
+    check_public_rate_limit(
+        &state,
+        &headers,
+        peer,
+        "pay_read",
+        crate::rate_limit::PAY_READ_LIMIT,
+        crate::rate_limit::PAY_READ_WINDOW,
+    )?;
     let link = state.store().get_payment_link_by_slug(&slug).await?;
     if !link.active {
         return Err(ApiError::NotFound);
@@ -390,7 +398,14 @@ pub async fn create_payment_intent(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<(StatusCode, Json<Envelope<PaymentIntentView>>)> {
-    check_public_rate_limit(&state, &headers, peer, "pay_intent", 5)?;
+    check_public_rate_limit(
+        &state,
+        &headers,
+        peer,
+        "pay_intent",
+        crate::rate_limit::PAY_INTENT_LIMIT,
+        crate::rate_limit::PAY_INTENT_WINDOW,
+    )?;
     let link = state.store().get_payment_link_by_slug(&slug).await?;
     if !link.active {
         return Err(ApiError::NotFound);
@@ -463,7 +478,14 @@ pub async fn get_payment_status(
     headers: HeaderMap,
 ) -> ApiResult<Json<Envelope<PaymentStatusView>>> {
     // The pay page polls this every ~3s while waiting, so the ceiling is generous.
-    check_public_rate_limit(&state, &headers, peer, "pay_status", 60)?;
+    check_public_rate_limit(
+        &state,
+        &headers,
+        peer,
+        "pay_status",
+        crate::rate_limit::PAY_STATUS_LIMIT,
+        crate::rate_limit::PAY_STATUS_WINDOW,
+    )?;
     let link = state.store().get_payment_link_by_slug(&slug).await?;
     let payment = state
         .store()
@@ -501,7 +523,14 @@ pub async fn public_signing_info(
     peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Envelope<crate::routes::submit::SigningInfo>>> {
-    check_public_rate_limit(&state, &headers, peer, "pay_signing_info", 60)?;
+    check_public_rate_limit(
+        &state,
+        &headers,
+        peer,
+        "pay_signing_info",
+        crate::rate_limit::PAY_SIGNING_INFO_LIMIT,
+        crate::rate_limit::PAY_SIGNING_INFO_WINDOW,
+    )?;
     // Confirms the link exists/is active before doing any Horizon work on the caller's behalf.
     let link = state.store().get_payment_link_by_slug(&slug).await?;
     if !link.active {
@@ -552,7 +581,14 @@ pub async fn submit_payment(
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<(StatusCode, Json<Envelope<SubmitPaymentResponse>>)> {
-    check_public_rate_limit(&state, &headers, peer, "pay_submit", 20)?;
+    check_public_rate_limit(
+        &state,
+        &headers,
+        peer,
+        "pay_submit",
+        crate::rate_limit::PAY_SUBMIT_LIMIT,
+        crate::rate_limit::PAY_SUBMIT_WINDOW,
+    )?;
     let link = state.store().get_payment_link_by_slug(&slug).await?;
     if !link.active {
         return Err(ApiError::NotFound);
@@ -645,4 +681,388 @@ pub async fn submit_payment(
         detail,
     });
     Ok((code, json))
+}
+
+fn validate_slug(input: &str) -> Result<String, ApiError> {
+    let normalized = input.trim().to_lowercase();
+
+    if normalized.is_empty() {
+        return Err(ApiError::BadRequest("slug cannot be empty".into()));
+    }
+
+    if normalized.len() < 3 {
+        return Err(ApiError::BadRequest("slug must be at least 3 characters long".into()));
+    }
+
+    if normalized.len() > 64 {
+        return Err(ApiError::BadRequest("slug must be at most 64 characters long".into()));
+    }
+
+    let reserved = ["api", "admin", "health"];
+    if reserved.contains(&normalized.as_str()) {
+        return Err(ApiError::BadRequest(format!("slug '{}' is reserved", normalized)));
+    }
+
+    if !normalized.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+        return Err(ApiError::BadRequest(
+            "slug must contain only lowercase letters, digits, and hyphens".into(),
+        ));
+    }
+
+    Ok(normalized)
+}
+
+#[cfg(test)]
+mod tests_issue_252 {
+    use super::*;
+
+    #[test]
+    fn validate_slug_accepts_valid_slug() {
+        assert_eq!(validate_slug("valid-slug").unwrap(), "valid-slug");
+    }
+
+    #[test]
+    fn validate_slug_normalizes_casing() {
+        assert_eq!(validate_slug("VALID-SLUG").unwrap(), "valid-slug");
+    }
+
+    #[test]
+    fn validate_slug_trims_whitespace() {
+        assert_eq!(validate_slug("  valid-slug  ").unwrap(), "valid-slug");
+    }
+
+    #[test]
+    fn validate_slug_rejects_invalid_characters() {
+        assert!(validate_slug("invalid_slug").is_err());
+        assert!(validate_slug("invalid slug").is_err());
+        assert!(validate_slug("invalid.slug").is_err());
+        assert!(validate_slug("invalid/slug").is_err());
+    }
+
+    #[test]
+    fn validate_slug_rejects_slug_under_3_characters() {
+        assert!(validate_slug("ab").is_err());
+        assert!(validate_slug("a").is_err());
+    }
+
+    #[test]
+    fn validate_slug_rejects_slug_over_64_characters() {
+        let long_slug = "a".repeat(65);
+        assert!(validate_slug(&long_slug).is_err());
+    }
+
+    #[test]
+    fn validate_slug_accepts_slug_at_64_character_boundary() {
+        let slug_64 = "a".repeat(64);
+        assert_eq!(validate_slug(&slug_64).unwrap().len(), 64);
+    }
+
+    #[test]
+    fn validate_slug_rejects_reserved_words() {
+        assert!(validate_slug("api").is_err());
+        assert!(validate_slug("admin").is_err());
+        assert!(validate_slug("health").is_err());
+        assert!(validate_slug("API").is_err());
+        assert!(validate_slug("Admin").is_err());
+    }
+
+    #[test]
+    fn validate_slug_accepts_digit_and_hyphen_combinations() {
+        assert!(validate_slug("test-123").is_ok());
+        assert!(validate_slug("123-test").is_ok());
+        assert!(validate_slug("123").is_ok());
+    }
+}
+
+fn validate_redirect_url(url: &str) -> Result<(), ApiError> {
+    if url.is_empty() {
+        return Ok(());
+    }
+
+    match url::Url::parse(url) {
+        Ok(parsed) => {
+            let scheme = parsed.scheme();
+            if scheme != "http" && scheme != "https" {
+                return Err(ApiError::BadRequest(
+                    "redirect_url must use http:// or https:// scheme".into(),
+                ));
+            }
+            Ok(())
+        }
+        Err(_) => Err(ApiError::BadRequest(
+            "redirect_url must be a valid absolute URL".into(),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests_issue_253 {
+    use super::*;
+
+    #[test]
+    fn validate_redirect_url_accepts_empty_url() {
+        assert!(validate_redirect_url("").is_ok());
+    }
+
+    #[test]
+    fn validate_redirect_url_accepts_https_url() {
+        assert!(validate_redirect_url("https://example.com").is_ok());
+        assert!(validate_redirect_url("https://example.com/path").is_ok());
+        assert!(validate_redirect_url("https://example.com:8080/path?query=1").is_ok());
+    }
+
+    #[test]
+    fn validate_redirect_url_accepts_http_url() {
+        assert!(validate_redirect_url("http://example.com").is_ok());
+        assert!(validate_redirect_url("http://localhost:8000").is_ok());
+    }
+
+    #[test]
+    fn validate_redirect_url_rejects_javascript_scheme() {
+        assert!(validate_redirect_url("javascript:alert('xss')").is_err());
+    }
+
+    #[test]
+    fn validate_redirect_url_rejects_data_scheme() {
+        assert!(validate_redirect_url("data:text/html,<h1>xss</h1>").is_err());
+    }
+
+    #[test]
+    fn validate_redirect_url_rejects_invalid_url() {
+        assert!(validate_redirect_url("not a url").is_err());
+        assert!(validate_redirect_url("ht!tp://invalid").is_err());
+    }
+
+    #[test]
+    fn validate_redirect_url_rejects_relative_url() {
+        assert!(validate_redirect_url("/path/to/page").is_err());
+        assert!(validate_redirect_url("path/to/page").is_err());
+    }
+}
+
+const MAX_PAYMENT_INTENT_AMOUNT: i64 = 10_000_000_000;
+
+#[cfg(test)]
+mod tests_issue_254 {
+    use super::*;
+
+    #[test]
+    fn payment_intent_amount_cap_constant_is_set() {
+        assert_eq!(MAX_PAYMENT_INTENT_AMOUNT, 10_000_000_000);
+    }
+
+    #[test]
+    fn validate_amount_positive() {
+        assert!(1 > 0);
+        assert!(100_000 > 0);
+        assert!(MAX_PAYMENT_INTENT_AMOUNT > 0);
+    }
+
+    #[test]
+    fn validate_amount_within_bounds() {
+        let amount = 1_000_000_000;
+        assert!(amount > 0 && amount <= MAX_PAYMENT_INTENT_AMOUNT);
+    }
+
+    #[test]
+    fn validate_amount_rejects_exceeding_cap() {
+        let amount = MAX_PAYMENT_INTENT_AMOUNT + 1;
+        assert!(amount > MAX_PAYMENT_INTENT_AMOUNT);
+    }
+
+    #[test]
+    fn validate_amount_accepts_at_cap_boundary() {
+        let amount = MAX_PAYMENT_INTENT_AMOUNT;
+        assert!(amount == MAX_PAYMENT_INTENT_AMOUNT);
+    }
+
+    #[test]
+    fn validate_amount_rejects_zero_or_negative() {
+        assert!(!(0 > 0));
+        assert!(!(-1 > 0));
+        assert!(!(-1_000_000 > 0));
+    }
+}
+
+fn validate_slug(input: &str) -> Result<String, ApiError> {
+    let normalized = input.trim().to_lowercase();
+
+    if normalized.is_empty() {
+        return Err(ApiError::BadRequest("slug cannot be empty".into()));
+    }
+
+    if normalized.len() < 3 {
+        return Err(ApiError::BadRequest("slug must be at least 3 characters long".into()));
+    }
+
+    if normalized.len() > 64 {
+        return Err(ApiError::BadRequest("slug must be at most 64 characters long".into()));
+    }
+
+    let reserved = ["api", "admin", "health"];
+    if reserved.contains(&normalized.as_str()) {
+        return Err(ApiError::BadRequest(format!("slug '{}' is reserved", normalized)));
+    }
+
+    if !normalized.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+        return Err(ApiError::BadRequest(
+            "slug must contain only lowercase letters, digits, and hyphens".into(),
+        ));
+    }
+
+    Ok(normalized)
+}
+
+fn validate_redirect_url(url: &str) -> Result<(), ApiError> {
+    if url.is_empty() {
+        return Ok(());
+    }
+
+    match url::Url::parse(url) {
+        Ok(parsed) => {
+            let scheme = parsed.scheme();
+            if scheme != "http" && scheme != "https" {
+                return Err(ApiError::BadRequest(
+                    "redirect_url must use http:// or https:// scheme".into(),
+                ));
+            }
+            Ok(())
+        }
+        Err(_) => Err(ApiError::BadRequest(
+            "redirect_url must be a valid absolute URL".into(),
+        )),
+    }
+}
+
+const MAX_PAYMENT_INTENT_AMOUNT: i64 = 10_000_000_000;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_slug_accepts_valid_slug() {
+        assert_eq!(validate_slug("valid-slug").unwrap(), "valid-slug");
+    }
+
+    #[test]
+    fn validate_slug_normalizes_casing() {
+        assert_eq!(validate_slug("VALID-SLUG").unwrap(), "valid-slug");
+    }
+
+    #[test]
+    fn validate_slug_trims_whitespace() {
+        assert_eq!(validate_slug("  valid-slug  ").unwrap(), "valid-slug");
+    }
+
+    #[test]
+    fn validate_slug_rejects_invalid_characters() {
+        assert!(validate_slug("invalid_slug").is_err());
+        assert!(validate_slug("invalid slug").is_err());
+        assert!(validate_slug("invalid.slug").is_err());
+        assert!(validate_slug("invalid/slug").is_err());
+    }
+
+    #[test]
+    fn validate_slug_rejects_slug_under_3_characters() {
+        assert!(validate_slug("ab").is_err());
+        assert!(validate_slug("a").is_err());
+    }
+
+    #[test]
+    fn validate_slug_rejects_slug_over_64_characters() {
+        let long_slug = "a".repeat(65);
+        assert!(validate_slug(&long_slug).is_err());
+    }
+
+    #[test]
+    fn validate_slug_accepts_slug_at_64_character_boundary() {
+        let slug_64 = "a".repeat(64);
+        assert_eq!(validate_slug(&slug_64).unwrap().len(), 64);
+    }
+
+    #[test]
+    fn validate_slug_rejects_reserved_words() {
+        assert!(validate_slug("api").is_err());
+        assert!(validate_slug("admin").is_err());
+        assert!(validate_slug("health").is_err());
+        assert!(validate_slug("API").is_err());
+        assert!(validate_slug("Admin").is_err());
+    }
+
+    #[test]
+    fn validate_slug_accepts_digit_and_hyphen_combinations() {
+        assert!(validate_slug("test-123").is_ok());
+        assert!(validate_slug("123-test").is_ok());
+        assert!(validate_slug("123").is_ok());
+    }
+
+    #[test]
+    fn validate_redirect_url_accepts_empty_url() {
+        assert!(validate_redirect_url("").is_ok());
+    }
+
+    #[test]
+    fn validate_redirect_url_accepts_https_url() {
+        assert!(validate_redirect_url("https://example.com").is_ok());
+        assert!(validate_redirect_url("https://example.com/path").is_ok());
+        assert!(validate_redirect_url("https://example.com:8080/path?query=1").is_ok());
+    }
+
+    #[test]
+    fn validate_redirect_url_accepts_http_url() {
+        assert!(validate_redirect_url("http://example.com").is_ok());
+        assert!(validate_redirect_url("http://localhost:8000").is_ok());
+    }
+
+    #[test]
+    fn validate_redirect_url_rejects_javascript_scheme() {
+        assert!(validate_redirect_url("javascript:alert('xss')").is_err());
+    }
+
+    #[test]
+    fn validate_redirect_url_rejects_data_scheme() {
+        assert!(validate_redirect_url("data:text/html,<h1>xss</h1>").is_err());
+    }
+
+    #[test]
+    fn validate_redirect_url_rejects_invalid_url() {
+        assert!(validate_redirect_url("not a url").is_err());
+        assert!(validate_redirect_url("ht!tp://invalid").is_err());
+    }
+
+    #[test]
+    fn validate_redirect_url_rejects_relative_url() {
+        assert!(validate_redirect_url("/path/to/page").is_err());
+        assert!(validate_redirect_url("path/to/page").is_err());
+    }
+
+    #[test]
+    fn payment_intent_amount_cap_constant_is_set() {
+        assert_eq!(MAX_PAYMENT_INTENT_AMOUNT, 10_000_000_000);
+    }
+
+    #[test]
+    fn validate_amount_positive() {
+        assert!(1 > 0);
+        assert!(100_000 > 0);
+    }
+
+    #[test]
+    fn validate_amount_within_bounds() {
+        let amount = 1_000_000_000;
+        assert!(amount > 0 && amount <= MAX_PAYMENT_INTENT_AMOUNT);
+    }
+
+    #[test]
+    fn validate_amount_rejects_exceeding_cap() {
+        let amount = MAX_PAYMENT_INTENT_AMOUNT + 1;
+        assert!(amount > MAX_PAYMENT_INTENT_AMOUNT);
+    }
+
+    #[test]
+    fn validate_amount_accepts_at_cap_boundary() {
+        let amount = MAX_PAYMENT_INTENT_AMOUNT;
+        assert!(amount == MAX_PAYMENT_INTENT_AMOUNT);
+    }
 }

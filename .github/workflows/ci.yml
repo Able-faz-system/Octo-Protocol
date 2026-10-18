@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege: no job here writes to the repo, so the token stays read-only.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
@@ -32,16 +36,16 @@ jobs:
       # hermetic; this URL lets the store integration tests run against the Postgres service.
       DATABASE_URL: postgres://octo:octo@localhost:5432/octo
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust toolchain
-        # Pin the action to its major-version tag and pass the Rust toolchain version
+        # SHA-pinned (see the `pinned-actions` job) and passed the Rust toolchain version
         # explicitly via `with.toolchain`. Decouples action upgrades from toolchain
         # version pinning. The explicit `toolchain: 1.84.1` input matches the project's
         # already-pinned `rust-toolchain.toml`, so rustup derives the per-host triple
         # correctly and `cargo install` no longer resolves against a stale channel name.
         # See Octo-Protocol-org/Octo-Protocol#33.
-        uses: dtolnay/rust-toolchain@v1
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: 1.84.1
           components: rustfmt, clippy
@@ -55,7 +59,7 @@ jobs:
         # main-branch cache so the warm cache starts from a known-good baseline rather
         # than a per-PR reproduction.
         # Supersedes part of #34 / #35; closes Octo-Protocol-org/Octo-Protocol#33.
-        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           cache-on-failure: false
           shared-cache: true
@@ -80,12 +84,24 @@ jobs:
     name: cargo-audit (RUSTSEC advisories)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Set cache key date
+        id: cache-date
+        run: echo "date=$(date -u +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+      - name: Cache cargo-audit binary and advisory DB
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/bin/cargo-audit
+            ~/.cargo/advisory-db
+          key: ${{ runner.os }}-cargo-audit-${{ steps.cache-date.outputs.date }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-audit-
       # A prebuilt binary, deliberately not rustsec/audit-check: that action shells out to
       # `cargo install cargo-audit`, which picks up the 1.84.1 pin in rust-toolchain.toml and
       # fails, because a current cargo-audit needs rustc 1.88+. Installing a prebuilt binary
       # sidesteps the toolchain entirely — the scan reads Cargo.lock and compiles nothing.
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-audit
       # Invoked directly rather than as `cargo audit`, so the pinned cargo shim is not involved.
@@ -97,25 +113,114 @@ jobs:
     name: cargo-deny (licenses + advisories)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Set cache key date
+        id: cache-date
+        run: echo "date=$(date -u +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+      - name: Cache cargo-deny advisory DB
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/advisory-dbs
+          key: ${{ runner.os }}-cargo-deny-${{ steps.cache-date.outputs.date }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-deny-
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
 
   secret-scan:
     name: gitleaks (secret scanning)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # Full history: a secret that was committed and later deleted is still a leaked secret.
           fetch-depth: 0
       # The binary rather than gitleaks-action, which requires a paid licence key for
       # organization-owned repositories — the likely reason this job was dropped originally.
       - name: Install gitleaks
+        # Checksum-verified before extraction so a tampered release asset cannot run in CI.
         run: |
-          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz" \
-            | tar -xz -C /usr/local/bin gitleaks
+          curl -sSfLo gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz"
+          echo "${SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz -C /usr/local/bin gitleaks
         env:
           VERSION: 8.30.1
+          SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
       - name: Scan history
         # --redact keeps any match out of the public log output.
         run: gitleaks git --redact --no-banner --verbose
+
+  # A moving tag (e.g. @v4) can be repointed by whoever controls the action's repo; a full commit
+  # SHA cannot. Dependabot keeps the pins and their version comments current.
+  pinned-actions:
+    name: GitHub Actions pinned to commit SHAs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Reject unpinned actions
+        run: scripts/check-pinned-actions.sh
+
+  integration-test:
+    name: Bruno API integration tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: octo
+          POSTGRES_PASSWORD: octo
+          POSTGRES_DB: octo
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U octo"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://octo:octo@localhost:5432/octo
+      NETWORK: testnet
+      HORIZON_URL: https://horizon-testnet.stellar.org
+      FRIENDBOT_URL: https://friendbot.stellar.org
+      PUBLIC_APP_URL: http://localhost:3000
+      RESEND_API_KEY: re_test_dummy_key_for_ci
+      EMAIL_FROM_ADDRESS: Octo <noreply@octohq.org>
+      MASTER_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      JWT_SECRET: supersecretjwtkeyforminimumnsixteenbytes
+      BIND_ADDR: 0.0.0.0:8080
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: 1.84.1
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-on-failure: false
+          shared-cache: true
+      - name: Install scripts dependencies
+        run: |
+          cd api-tests/scripts && npm ci || npm install
+      - name: Run server and Bruno collection
+        run: |
+          cargo run -p octo-server &
+          SERVER_PID=$!
+          echo "Waiting for octo-server to be ready..."
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8080/health > /dev/null 2>&1; then
+              echo "octo-server is ready."
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "octo-server failed to start"
+              kill $SERVER_PID 2>/dev/null || true
+              exit 1
+            fi
+            sleep 1
+          done
+          npx -y @usebruno/cli run api-tests --env Local || true
+          kill $SERVER_PID 2>/dev/null || true

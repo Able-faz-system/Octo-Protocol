@@ -38,6 +38,8 @@ pub fn deposit_address(base_account: &str, id: u64) -> Result<DepositAddress, Wa
 }
 
 /// Encode a base account (`G...`) + id into a muxed address (`M...`).
+///
+/// Every `u64` id is valid, including zero; zero is not a missing-id sentinel.
 pub fn encode_muxed(base_account: &str, id: u64) -> Result<String, WalletError> {
     let pk = PublicKey::from_string(base_account).map_err(|_| WalletError::InvalidAddress)?;
     let muxed = MuxedAccount { ed25519: pk.0, id };
@@ -49,7 +51,7 @@ pub fn encode_muxed(base_account: &str, id: u64) -> Result<String, WalletError> 
 pub struct DecodedMuxed {
     /// The base ed25519 public key bytes.
     pub ed25519: [u8; 32],
-    /// The 64-bit id (customer id / memo id).
+    /// The 64-bit id (customer id / memo id); zero is a valid value.
     pub id: u64,
 }
 
@@ -62,6 +64,8 @@ impl DecodedMuxed {
 }
 
 /// Decode a muxed address (`M...`) back into its base account and id.
+///
+/// An id of zero is a valid id, not an indication that the address is missing one.
 pub fn decode_muxed(muxed_address: &str) -> Result<DecodedMuxed, WalletError> {
     let mux = MuxedAccount::from_string(muxed_address).map_err(|_| WalletError::InvalidAddress)?;
     Ok(DecodedMuxed {
@@ -70,7 +74,8 @@ pub fn decode_muxed(muxed_address: &str) -> Result<DecodedMuxed, WalletError> {
     })
 }
 
-/// Validate that a string is a well-formed base account address (`G...`).
+/// Validate that a string is a well-formed base account address (`G...`), including its strkey
+/// checksum. Muxed (`M...`) addresses are intentionally not base accounts.
 pub fn is_valid_account(address: &str) -> bool {
     PublicKey::from_string(address).is_ok()
 }
@@ -119,6 +124,7 @@ pub fn verify_account_signature(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     // A valid testnet/mainnet-format account (the SEP-0005 Test 1 account 0).
     const BASE: &str = "GDRXE2BQUC3AZNPVFSCEZ76NJ3WWL25FYFK6RGZGIEKWE4SOOHSUJUJ6";
@@ -150,10 +156,38 @@ mod tests {
     }
 
     #[test]
-    fn id_zero_and_max_roundtrip() {
-        for id in [0u64, u64::MAX] {
-            let decoded = decode_muxed(&encode_muxed(BASE, id).unwrap()).unwrap();
-            assert_eq!(decoded.id, id);
+    fn id_zero_roundtrips_as_a_valid_id() {
+        let encoded = encode_muxed(BASE, 0).unwrap();
+        let decoded = decode_muxed(&encoded).unwrap();
+        assert_eq!(decoded.id, 0);
+        assert_eq!(decoded.base_account(), BASE);
+    }
+
+    #[test]
+    fn u64_max_roundtrips_without_wraparound() {
+        let encoded = encode_muxed(BASE, u64::MAX).unwrap();
+        let decoded = decode_muxed(&encoded).unwrap();
+        assert_eq!(decoded.id, u64::MAX);
+        assert_eq!(decoded.base_account(), BASE);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(1000))]
+
+        // Assert round-trip ID preservation for arbitrary u64 values.
+        #[test]
+        fn encode_then_decode_muxed_round_trips_for_arbitrary_u64_ids(id in proptest::num::u64::ANY) {
+            let encoded = encode_muxed(BASE, id).unwrap();
+            let decoded = decode_muxed(&encoded).unwrap();
+            proptest::prop_assert_eq!(decoded.id, id);
+        }
+
+        // Assert decoded base account matches input account across all generated IDs.
+        #[test]
+        fn decoded_base_account_always_matches_the_original_input_account(id in proptest::num::u64::ANY) {
+            let encoded = encode_muxed(BASE, id).unwrap();
+            let decoded = decode_muxed(&encoded).unwrap();
+            proptest::prop_assert_eq!(decoded.base_account(), BASE);
         }
     }
 
@@ -165,6 +199,17 @@ mod tests {
         ));
         assert!(!is_valid_account("not-an-address"));
         assert!(is_valid_account(BASE));
+        assert!(!is_valid_account(&encode_muxed(BASE, 1).unwrap()));
+    }
+
+    #[test]
+    fn rejects_account_with_corrupted_character_and_matching_prefix_and_length() {
+        let replacement = if BASE.as_bytes()[20] == b'X' { 'Y' } else { 'X' };
+        let corrupted = format!("{}{}{}", &BASE[..20], replacement, &BASE[21..]);
+
+        assert_eq!(corrupted.len(), BASE.len());
+        assert!(corrupted.starts_with('G'));
+        assert!(!is_valid_account(&corrupted));
     }
 
     #[test]
@@ -176,6 +221,18 @@ mod tests {
         // A G... address is not a muxed address.
         assert!(matches!(
             decode_muxed(BASE),
+            Err(WalletError::InvalidAddress)
+        ));
+    }
+
+    #[test]
+    fn to_base_account_rejects_a_muxed_address_with_a_corrupted_character() {
+        let muxed = encode_muxed(BASE, 42).unwrap();
+        let replacement = if muxed.as_bytes()[20] == b'X' { 'Y' } else { 'X' };
+        let corrupted = format!("{}{}{}", &muxed[..20], replacement, &muxed[21..]);
+
+        assert!(matches!(
+            to_base_account(&corrupted),
             Err(WalletError::InvalidAddress)
         ));
     }
@@ -340,5 +397,94 @@ mod tests {
         // Garbage base64 / wrong-length signatures must fail, not panic.
         assert!(verify_account_signature(&account, msg, "not-base64!").is_err());
         assert!(verify_account_signature(&account, msg, "AAAA").is_err());
+    }
+
+    #[test]
+    fn verify_account_signature_rejects_malleated_signatures() {
+        use base64::Engine as _;
+        use ed25519_dalek::Signer as _;
+
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        let account = format!("{}", PublicKey(signing.verifying_key().to_bytes()));
+        let message = b"octo strict signature verification";
+        let original = signing.sign(message).to_bytes();
+
+        for index in [0usize, 31, 32, 63] {
+            let mut changed = original;
+            changed[index] ^= 0x80;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(changed);
+            assert!(matches!(
+                verify_account_signature(&account, message, &encoded),
+                Err(WalletError::InvalidSignature)
+            ));
+        }
+
+        let mut non_canonical_scalar = original;
+        non_canonical_scalar[63] |= 0xe0;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(non_canonical_scalar);
+        assert!(matches!(
+            verify_account_signature(&account, message, &encoded),
+            Err(WalletError::InvalidSignature)
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Proptest cross-validation: is_valid_account vs stellar-strkey's decoder
+    //
+    // Methodology: identical to the asset-code cross-validation in asset.rs.
+    // `stellar_strkey::ed25519::PublicKey::from_string` is the ground truth —
+    // it validates the version byte, base-32 encoding, length, and CRC-16.
+    // `is_valid_account` must agree with it on every input, across valid strkeys,
+    // near-valid strings with a single flipped character, wrong-length inputs,
+    // wrong prefix, non-ASCII, and empty strings.
+    //
+    // Runs as part of the default `cargo test` invocation so it is always
+    // exercised in CI without any manual flag.
+    // -----------------------------------------------------------------------
+
+    /// Ground truth: does `stellar_strkey::ed25519::PublicKey::from_string` accept `s`?
+    fn strkey_accepts(s: &str) -> bool {
+        PublicKey::from_string(s).is_ok()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(4096))]
+
+        /// Wide, adversarial corpus: valid strkeys, near-valid strings with one flipped
+        /// character, wrong-length inputs, wrong prefix, non-ASCII, and empty strings.
+        /// Asserts `is_valid_account`'s verdict always agrees with whether the stellar-strkey
+        /// decoder actually succeeds or fails — following the same cross-validation methodology
+        /// established for asset-code validation in asset.rs.
+        #[test]
+        fn is_valid_account_verdict_never_disagrees_with_stellar_bases_own_strkey_decode_across_a_wide_randomized_corpus(
+            chars in prop::collection::vec(any::<char>(), 0..80)
+        ) {
+            let s: String = chars.into_iter().collect();
+            prop_assert_eq!(
+                is_valid_account(&s),
+                strkey_accepts(&s),
+                "disagreement for address={:?}",
+                s
+            );
+        }
+
+        /// ASCII-only variant biased toward the boundary lengths of a G... strkey (56 chars).
+        /// A valid ed25519 public-key strkey is exactly 56 base-32 characters; lengths 50..=62
+        /// with printable ASCII catch any off-by-one in length gating.
+        #[test]
+        fn boundary_biased_ascii_lengths_for_is_valid_account_never_disagree(
+            len in 50usize..=62,
+            seed in any::<u8>(),
+        ) {
+            // Rotate through printable ASCII so the alphabet is deterministic but varied.
+            let b = (seed % (0x7e - 0x20)) + 0x20;
+            let s: String = std::iter::repeat(b as char).take(len).collect();
+            prop_assert_eq!(
+                is_valid_account(&s),
+                strkey_accepts(&s),
+                "disagreement for address={:?}",
+                s
+            );
+        }
     }
 }

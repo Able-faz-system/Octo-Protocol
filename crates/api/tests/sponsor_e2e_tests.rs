@@ -134,6 +134,29 @@ async fn create_wallet(app: &Router, token: &str) -> (String, String) {
     (id, address)
 }
 
+// Create a client-custody wallet without provisioning a gas tank.
+async fn create_wallet_without_gas_tank(app: &Router, token: &str) -> (String, String) {
+    let kp = DalekKeyPair::random().unwrap();
+    let reg_body = common::wallet_body(app, token, &kp).await;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/wallets")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(reg_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let w = body_json(resp).await;
+    let id = w["data"]["id"].as_str().unwrap().to_string();
+    let address = w["data"]["address"].as_str().unwrap().to_string();
+    (id, address)
+}
+
 /// Local mock Horizon that accepts POST /transactions and returns a successful submission.
 async fn start_mock_horizon() -> String {
     async fn submit() -> axum::Json<serde_json::Value> {
@@ -811,5 +834,215 @@ async fn e2e_concurrent_sponsor_requests_respect_budget() {
     assert!(
         total.0 <= daily_budget,
         "total reserved fees {total:?} must not exceed budget {daily_budget}"
+    );
+}
+
+#[tokio::test]
+async fn sponsor_rejects_when_sponsorship_is_disabled_for_the_wallet() {
+    let horizon = start_mock_horizon().await;
+    let Some(state) = test_state(horizon).await else {
+        return;
+    };
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
+    let (wallet_id, master_g) = create_wallet(&app, &token).await;
+
+    let uri = format!("/v1/wallets/{wallet_id}/sponsorship");
+    let resp = app
+        .clone()
+        .oneshot(put_json_auth(
+            &uri,
+            r#"{"enabled":false,"daily_budget_stroops":1000000}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let xdr = random_payment_xdr(&master_g);
+    let body = format!(r#"{{"transaction_xdr":"{xdr}","max_base_fee_stroops":200}}"#);
+    let resp = app
+        .oneshot(post_json_auth(
+            &format!("/v1/wallets/{wallet_id}/sponsor"),
+            &body,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let json = body_json(resp).await;
+    assert_eq!(
+        json["message"],
+        "gas sponsorship is not enabled for this wallet"
+    );
+}
+
+#[tokio::test]
+async fn sponsor_rejects_a_max_fee_above_the_per_tx_cap() {
+    let horizon = start_mock_horizon().await;
+    let Some(state) = test_state(horizon).await else {
+        return;
+    };
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
+    let (wallet_id, master_g) = create_wallet(&app, &token).await;
+
+    let cap = 250_000_i64;
+    let uri = format!("/v1/wallets/{wallet_id}/sponsorship");
+    let resp = app
+        .clone()
+        .oneshot(put_json_auth(
+            &uri,
+            &format!(r#"{{"enabled":true,"per_tx_fee_cap_stroops":{cap}}}"#),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let xdr = random_payment_xdr(&master_g);
+    let body = format!(r#"{{"transaction_xdr":"{xdr}","max_base_fee_stroops":{}}}"#, cap + 1);
+    let resp = app
+        .oneshot(post_json_auth(
+            &format!("/v1/wallets/{wallet_id}/sponsor"),
+            &body,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(resp).await;
+    assert!(
+        json["message"]
+            .as_str()
+            .unwrap()
+            .contains("exceeds the per-transaction cap"),
+        "expected cap error, got: {}",
+        json["message"]
+    );
+}
+
+#[tokio::test]
+async fn sponsor_rejects_a_self_sponsoring_inner_transaction() {
+    let horizon = start_mock_horizon().await;
+    let Some(state) = test_state(horizon).await else {
+        return;
+    };
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
+    let (wallet_id, master_g) = create_wallet(&app, &token).await;
+    enable_sponsorship_via_api(&app, &token, &wallet_id).await;
+
+    let dest_g = "GBAW5XGWORWVFE2XTJYDTLDHXTY2Q2MO73HYCGB3XMFMQ562Q2W2GJQX";
+    let master_g_key = stellar_base::crypto::PublicKey::from_account_id(&master_g).unwrap();
+    let dest = stellar_base::crypto::PublicKey::from_account_id(dest_g).unwrap();
+    let op = Operation::new_payment()
+        .with_destination(dest)
+        .with_amount(stellar_base::amount::Stroops::new(100))
+        .unwrap()
+        .with_asset(stellar_base::asset::Asset::new_native())
+        .build()
+        .unwrap();
+    let tx = Transaction::builder(master_g_key, 1, MIN_BASE_FEE)
+        .add_operation(op)
+        .into_transaction()
+        .unwrap();
+    let xdr = tx.into_envelope().xdr_base64().unwrap();
+
+    let body = format!(r#"{{"transaction_xdr":"{xdr}","max_base_fee_stroops":200}}"#);
+    let resp = app
+        .oneshot(post_json_auth(
+            &format!("/v1/wallets/{wallet_id}/sponsor"),
+            &body,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(resp).await;
+    assert_eq!(
+        json["message"],
+        "inner transaction source must not be the master account"
+    );
+}
+
+#[tokio::test]
+async fn sponsor_rejects_once_the_daily_budget_is_exhausted() {
+    let horizon = start_mock_horizon().await;
+    let Some(state) = test_state(horizon).await else {
+        return;
+    };
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
+    let (wallet_id, master_g) = create_wallet(&app, &token).await;
+
+    let uri = format!("/v1/wallets/{wallet_id}/sponsorship");
+    let resp = app
+        .clone()
+        .oneshot(put_json_auth(
+            &uri,
+            r#"{"enabled":true,"daily_budget_stroops":10000000}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let fee = 6_000_000;
+    let body1 = format!(
+        r#"{{"transaction_xdr":"{}","max_base_fee_stroops":{fee}}}"#,
+        random_payment_xdr(&master_g)
+    );
+    let sponsor_uri = format!("/v1/wallets/{wallet_id}/sponsor");
+    let resp = app
+        .clone()
+        .oneshot(post_json_auth(&sponsor_uri, &body1, &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let body2 = format!(
+        r#"{{"transaction_xdr":"{}","max_base_fee_stroops":{fee}}}"#,
+        random_payment_xdr(&master_g)
+    );
+    let resp = app
+        .oneshot(post_json_auth(&sponsor_uri, &body2, &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    let json = body_json(resp).await;
+    assert_eq!(json["message"], "daily sponsorship budget exceeded");
+}
+
+#[tokio::test]
+async fn sponsor_rejects_for_a_client_custody_wallet_with_no_gas_tank() {
+    let horizon = start_mock_horizon().await;
+    let Some(state) = test_state(horizon).await else {
+        return;
+    };
+    let app = build_router(state.clone());
+    let token = auth_token(&app, &state).await;
+    let (wallet_id, master_g) = create_wallet_without_gas_tank(&app, &token).await;
+    enable_sponsorship_via_api(&app, &token, &wallet_id).await;
+
+    let xdr = random_payment_xdr(&master_g);
+    let body = format!(r#"{{"transaction_xdr":"{xdr}","max_base_fee_stroops":200}}"#);
+    let resp = app
+        .oneshot(post_json_auth(
+            &format!("/v1/wallets/{wallet_id}/sponsor"),
+            &body,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let json = body_json(resp).await;
+    assert!(
+        json["message"]
+            .as_str()
+            .unwrap()
+            .contains("no gas-tank account"),
+        "expected gas-tank error, got: {}",
+        json["message"]
     );
 }

@@ -134,12 +134,24 @@ impl HorizonPayments {
     /// Oldest-first (`order=asc`) so we process and advance the cursor monotonically. Transient
     /// failures are retried with exponential backoff; the circuit breaker opens after repeated
     /// failures so the ingest loop doesn't pile up independent timeouts.
+    #[tracing::instrument(
+        name = "horizon_payments_after",
+        skip(self),
+        fields(
+            call_type = "payments_after",
+            account_g = %account_g,
+            cursor = ?cursor,
+            limit = limit,
+            outcome = tracing::field::Empty
+        )
+    )]
     pub async fn payments_after(
         &self,
         account_g: &str,
         cursor: Option<&str>,
         limit: u32,
     ) -> Result<Vec<PaymentRecord>, HorizonError> {
+        let span = tracing::Span::current();
         let mut url = format!(
             "{}/accounts/{}/payments?order=asc&limit={}&join=transactions",
             self.base_url.trim_end_matches('/'),
@@ -178,6 +190,15 @@ impl HorizonPayments {
         })
         .await;
 
+        match &result {
+            Ok(_) => span.record("outcome", "success"),
+            Err(ResilienceError::Circuit) => span.record("outcome", "circuit_open"),
+            Err(ResilienceError::Exhausted(IngestFetchError::Decode)) => {
+                span.record("outcome", "decode_error")
+            }
+            Err(ResilienceError::Exhausted(_)) => span.record("outcome", "failure"),
+        };
+
         match result {
             Ok(records) => Ok(records),
             Err(ResilienceError::Circuit) => Err(HorizonError::CircuitOpen),
@@ -214,5 +235,40 @@ impl std::fmt::Display for IngestFetchError {
             Self::Decode => write!(f, "decode error"),
             Self::Permanent => write!(f, "permanent error"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    // Asserts that horizon_payments_after emits its distinct named tracing span.
+    #[tokio::test]
+    async fn horizon_payments_after_emits_tracing_span() {
+        let recorded_spans = Arc::new(Mutex::new(Vec::<String>::new()));
+        let spans_clone = recorded_spans.clone();
+
+        struct SpanRecorder(Arc<Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SpanRecorder {
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                _id: &tracing::span::Id,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                self.0.lock().unwrap().push(attrs.metadata().name().to_string());
+            }
+        }
+
+        let subscriber = tracing_subscriber::registry().with(SpanRecorder(spans_clone));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let client = HorizonPayments::new("http://127.0.0.1:1");
+        let _ = client.payments_after("GABCDEFGHIJKLMNOPQRSTUVWXYZ", None, 10).await;
+
+        let spans = recorded_spans.lock().unwrap().clone();
+        assert!(spans.contains(&"horizon_payments_after".to_string()));
     }
 }

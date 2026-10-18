@@ -5,6 +5,13 @@
 //! data:image/svg+xml (and often data: images generally), so anything shown here has to be
 //! fetchable. The logo lives on Cloudinary; the small icon set is served from octohq.org/email/
 //! (Octo-frontend's public/email/).
+//!
+//! ## Escaping convention
+//!
+//! Every value that originates outside this server — user input (email address, labels), a
+//! user-signed transaction (asset code, destination), or a Horizon response (tx hash, error
+//! detail) — MUST go through [`html_escape`] before it is interpolated into HTML. Only values
+//! the server generates itself (the numeric OTP, the formatted amount, fixed copy) skip it.
 
 const BURGUNDY: &str = "#7b1733";
 const BURGUNDY_BRIGHT: &str = "#b81f4d";
@@ -53,6 +60,23 @@ fn socials() -> String {
     .join("")
 }
 
+/// Escape `&`, `<`, `>`, `"` and `'` so an untrusted value renders as text in HTML body and
+/// attribute contexts, never as markup.
+pub fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 fn shell(body: &str, icon: Icon) -> String {
     let icon_url = format!("{ICON_BASE}/{}", icon_url(icon));
     let socials = socials();
@@ -82,6 +106,8 @@ fn shell(body: &str, icon: Icon) -> String {
 pub fn otp_email(code: &str, purpose: &str) -> String {
     let action = match purpose {
         "withdrawal" => "confirm a withdrawal",
+        "password_reset" => "reset your password",
+        "email_change" => "confirm your new email address",
         _ => "verify your email",
     };
     shell(
@@ -97,8 +123,32 @@ pub fn otp_email(code: &str, purpose: &str) -> String {
     )
 }
 
+/// Escape untrusted text for interpolation into HTML (emails are only loosely validated).
+fn escape_html(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// Sent to the OLD address after an email change, so a hijacked change is noticed.
+pub fn email_changed_email(new_email: &str) -> String {
+    let new_email = escape_html(new_email);
+    shell(
+        &format!(
+            "<p style=\"margin:0 0 4px;font-size:18px;font-weight:700;color:#111;\">Your login email was changed</p>\
+<p style=\"margin:0;color:#666;\">This account's email is now {new_email}. If this wasn't you, reset your password right away.</p>"
+        ),
+        Icon::Warn,
+    )
+}
+
 /// Sent once, right after signup verification succeeds.
 pub fn welcome_email(email: &str) -> String {
+    // The address is user-supplied at signup; RFC 5322 local parts may legally contain `<"'&`.
+    let email = html_escape(email);
     shell(
         &format!(
             "<p style=\"margin:0 0 4px;font-size:18px;font-weight:700;color:#111;\">Welcome to Octo 🎉</p>\
@@ -116,6 +166,12 @@ pub fn withdrawal_success_email(
     destination: &str,
     tx_hash: &str,
 ) -> String {
+    // Asset and destination come from the user-signed XDR, the hash from Horizon's response.
+    let (asset, destination, tx_hash) = (
+        html_escape(asset),
+        html_escape(destination),
+        html_escape(tx_hash),
+    );
     shell(
         &format!(
             "<p style=\"margin:0 0 4px;font-size:18px;font-weight:700;color:#111;\">Withdrawal confirmed</p>\
@@ -137,6 +193,12 @@ pub fn withdrawal_failed_email(
     destination: &str,
     reason: &str,
 ) -> String {
+    // Asset and destination come from the user-signed XDR, the reason may echo Horizon's detail.
+    let (asset, destination, reason) = (
+        html_escape(asset),
+        html_escape(destination),
+        html_escape(reason),
+    );
     shell(
         &format!(
             "<p style=\"margin:0 0 4px;font-size:18px;font-weight:700;color:#111;\">Withdrawal attempt failed</p>\

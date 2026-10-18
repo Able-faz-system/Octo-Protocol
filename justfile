@@ -61,3 +61,25 @@ db-reset:
 # Run the server.
 run:
     cargo run -p octo-server
+
+# Run the Bruno API-tests integration suite non-interactively against a local server.
+test-integration:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build -p octo-server
+    cargo run -p octo-server &
+    SERVER_PID=$!
+    trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
+    echo "Waiting for octo-server to be ready..."
+    for i in $(seq 1 30); do
+        if curl -sf http://localhost:8080/health > /dev/null 2>&1; then
+            echo "octo-server is ready."
+            break
+        fi
+        if [ "$i" -eq 30 ]; then
+            echo "octo-server failed to start"
+            exit 1
+        fi
+        sleep 1
+    done
+    npx -y @usebruno/cli run api-tests --env Local

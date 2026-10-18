@@ -57,7 +57,7 @@ pub async fn get_config(
     Ok(Envelope::ok(AllowlistConfigView { enabled }))
 }
 
-/// `PUT /v1/wallets/:id/whitelist/config`
+/// `PUT /v1/wallets/:id/whitelist/config`; requires at least one field (see `docs/api.md`).
 pub async fn put_config(
     State(state): State<AppState>,
     Path(wallet_id): Path<Uuid>,
@@ -66,6 +66,11 @@ pub async fn put_config(
 ) -> ApiResult<Json<Envelope<AllowlistConfigView>>> {
     owned_wallet(&state, &headers, wallet_id).await?;
     let req: AllowlistConfigRequest = parse_optional(&body)?;
+    if req.enabled.is_none() {
+        return Err(ApiError::BadRequest(
+            "at least one field must be provided".into(),
+        ));
+    }
     let enabled = req.enabled.unwrap_or(false);
 
     // Enabling with an empty list would lock the wallet out of every destination — including

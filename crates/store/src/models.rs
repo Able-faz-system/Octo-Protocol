@@ -37,12 +37,18 @@ pub struct Wallet {
     pub gas_tank_account_g: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub archived_at: Option<DateTime<Utc>>,
 }
 
 impl Wallet {
     /// True when the private key lives only client-side (server cannot sign).
     pub fn is_client_custody(&self) -> bool {
         self.custody == "client"
+    }
+
+    /// True when the wallet has been archived.
+    pub fn is_archived(&self) -> bool {
+        self.archived_at.is_some()
     }
 }
 
@@ -111,8 +117,12 @@ pub struct User {
     pub password_hash: String,
     /// Null until the signup/login OTP is verified.
     pub email_verified_at: Option<DateTime<Utc>>,
+    /// Bumped to revoke every live session token at once (e.g. on password reset).
+    pub session_epoch: i32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Bumped on password change; JWTs carrying an older epoch are rejected.
+    pub session_epoch: i32,
 }
 
 /// A registered webhook endpoint.
@@ -124,6 +134,7 @@ pub struct WebhookEndpoint {
     pub secret: String,
     pub active: bool,
     pub created_at: DateTime<Utc>,
+    pub deleted_at: Option<DateTime<Utc>>,
 }
 
 /// A single webhook delivery attempt (append-only log).
@@ -136,8 +147,17 @@ pub struct WebhookDelivery {
     pub status: String,
     pub attempts: i32,
     pub response_code: Option<i32>,
+    /// Truncated (≤ 1 KiB) response body from the last attempt; `None` if no response arrived.
+    pub response_body_snippet: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Recent delivery health rollup for a webhook endpoint.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, sqlx::FromRow)]
+pub struct WebhookDeliveryHealth {
+    pub recent_failure_count: i64,
+    pub last_successful_delivery_at: Option<DateTime<Utc>>,
 }
 
 /// An audit-log entry (append-only record of account activity).
@@ -160,6 +180,9 @@ pub struct ApiKey {
     pub prefix: String,
     pub key_hash: String,
     pub created_at: DateTime<Utc>,
+    pub scopes: Vec<String>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 /// A sponsored (fee-bump) transaction record.
@@ -206,7 +229,9 @@ pub struct GasSponsorshipConfig {
     pub enabled: bool,
     /// Max fee (stroops) the sponsor pays per transaction; `None` = no cap.
     pub per_tx_fee_cap_stroops: Option<i64>,
-    /// Rolling UTC-day budget (stroops); `None` = no budget limit.
+    /// Rolling UTC-day budget (stroops). `None` = unlimited; `Some(0)` = sponsorship fully
+    /// disabled for the day (every reservation is refused). Negative values are rejected at the
+    /// API and, defensively, treated like `Some(0)` by the store (fail closed).
     pub daily_budget_stroops: Option<i64>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
