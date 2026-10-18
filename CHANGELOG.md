@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Security: `octo-server` exits non-zero on mainnet when secrets are placeholders or low-entropy,
+  or when `HORIZON_URL` / `PUBLIC_APP_URL` / `PUBLIC_API_URL` are not HTTPS (#433).
+- CI: CycloneDX SBOM (full transitive tree) uploaded on every `main` build and attached to
+  releases (#432); every GitHub Action pinned to a commit SHA, enforced by a lint job (#431);
+  weekly grouped Dependabot for cargo and Actions, with crypto-crate breaking bumps held for
+  manual review and manifests routed to maintainers + security via CODEOWNERS (#430).
 - Workspace scaffold: `crypto`, `wallet-core`, `store`, `webhooks`, `ingest`, `api` crates and
   the `server` binary.
 - Repository tooling: CI (fmt, clippy, test, cargo-deny), `justfile`, `docker-compose` for local
