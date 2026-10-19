@@ -6,9 +6,12 @@ use crate::json::parse_optional;
 use crate::state::AppState;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
+use octo_store::IdempotencyClaim;
 use octo_wallet_core::encode_muxed;
+use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -47,15 +50,102 @@ pub struct CreatePaymentLinkRequest {
     pub amount_usdc_stroops: Option<i64>,
 }
 
+/// Idempotency scope for payment link creation; keys are namespaced per wallet and scope.
+const CREATE_LINK_IDEMPOTENCY_SCOPE: &str = "payment_link.create";
+
 /// `POST /v1/wallets/:id/payment-links`
+///
+/// Honours an optional `Idempotency-Key` header (#453): a retry with the same key and body
+/// replays the original `201` response instead of creating a second link, the same key with a
+/// different body is `409`, and keys expire after `IDEMPOTENCY_KEY_TTL_SECS` (24h).
 pub async fn create_payment_link(
     State(state): State<AppState>,
     Path(wallet_id): Path<Uuid>,
     headers: HeaderMap,
     body: Bytes,
-) -> ApiResult<(StatusCode, Json<Envelope<PaymentLinkView>>)> {
+) -> ApiResult<Response> {
     authorize_wallet_scope(&headers, &state, wallet_id, "write").await?;
-    let req: CreatePaymentLinkRequest = parse_optional(&body)?;
+    let Some(key) = idempotency_key(&headers)? else {
+        let view = create_link(&state, wallet_id, &body).await?;
+        return Ok(Envelope::created(view).into_response());
+    };
+
+    let store = state.store();
+    let request_hash = hex::encode(Sha256::digest(&body));
+    let scope = CREATE_LINK_IDEMPOTENCY_SCOPE;
+    match store
+        .claim_idempotency_key(wallet_id, scope, &key, &request_hash)
+        .await?
+    {
+        IdempotencyClaim::Claimed => match create_link(&state, wallet_id, &body).await {
+            Ok(view) => {
+                let response = serde_json::to_value(&view).map_err(|_| ApiError::Internal)?;
+                // On failure the claim stays in progress: retries get 409, never a duplicate.
+                if let Err(e) = store
+                    .complete_idempotency_key(wallet_id, scope, &key, 201, &response)
+                    .await
+                {
+                    tracing::warn!(error = ?e, "failed to store idempotent response");
+                }
+                Ok(Envelope::created(view).into_response())
+            }
+            Err(e) => {
+                // Nothing was created, so free the key for a corrected retry.
+                if let Err(release) = store.release_idempotency_key(wallet_id, scope, &key).await {
+                    tracing::warn!(error = ?release, "failed to release idempotency key");
+                }
+                Err(e)
+            }
+        },
+        IdempotencyClaim::Replay {
+            status_code,
+            response,
+        } => {
+            let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::CREATED);
+            let mut resp = (
+                status,
+                Json(Envelope {
+                    status_code,
+                    message: status.canonical_reason().unwrap_or("OK").into(),
+                    data: response,
+                }),
+            )
+                .into_response();
+            resp.headers_mut()
+                .insert("idempotent-replayed", HeaderValue::from_static("true"));
+            Ok(resp)
+        }
+        IdempotencyClaim::Mismatch => Err(ApiError::ConflictWith(
+            "Idempotency-Key was already used with a different request body".into(),
+        )),
+        IdempotencyClaim::InProgress => Err(ApiError::ConflictWith(
+            "a request with this Idempotency-Key is still in progress; retry shortly".into(),
+        )),
+    }
+}
+
+/// Read an optional `Idempotency-Key`: 1-255 visible ASCII characters, otherwise `400`.
+fn idempotency_key(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+    let Some(raw) = headers.get("idempotency-key") else {
+        return Ok(None);
+    };
+    let key = raw.to_str().unwrap_or_default();
+    let valid = (1..=255).contains(&key.len()) && key.bytes().all(|b| b.is_ascii_graphic());
+    if !valid {
+        return Err(ApiError::BadRequest(
+            "Idempotency-Key must be 1-255 visible ASCII characters".into(),
+        ));
+    }
+    Ok(Some(key.to_string()))
+}
+
+/// Validate the request, allocate the link's address and insert the link.
+async fn create_link(
+    state: &AppState,
+    wallet_id: Uuid,
+    body: &Bytes,
+) -> ApiResult<PaymentLinkView> {
+    let req: CreatePaymentLinkRequest = parse_optional(body)?;
     let name = req
         .name
         .filter(|n| !n.is_empty())
@@ -98,8 +188,8 @@ pub async fn create_payment_link(
         })
         .await?;
 
-    let url = checkout_url(&state, &link.slug);
-    let (code, json) = Envelope::created(PaymentLinkView {
+    let url = checkout_url(state, &link.slug);
+    Ok(PaymentLinkView {
         id: link.id,
         slug: link.slug,
         name: link.name,
@@ -111,8 +201,7 @@ pub async fn create_payment_link(
         collected_usdc_stroops: 0,
         created_at: link.created_at,
         url,
-    });
-    Ok((code, json))
+    })
 }
 
 /// `GET /v1/wallets/:id/payment-links`
@@ -819,6 +908,35 @@ fn validate_slug(input: &str) -> Result<String, ApiError> {
     }
 
     Ok(normalized)
+}
+
+#[cfg(test)]
+mod tests_issue_453 {
+    use super::*;
+
+    fn with_key(value: &[u8]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("idempotency-key", HeaderValue::from_bytes(value).unwrap());
+        h
+    }
+
+    #[test]
+    fn missing_key_is_optional() {
+        assert_eq!(idempotency_key(&HeaderMap::new()).unwrap(), None);
+    }
+
+    #[test]
+    fn valid_key_is_returned() {
+        let key = idempotency_key(&with_key(b"order-42_retry.1")).unwrap();
+        assert_eq!(key.as_deref(), Some("order-42_retry.1"));
+    }
+
+    #[test]
+    fn invalid_keys_are_rejected() {
+        assert!(idempotency_key(&with_key(b"has space")).is_err());
+        assert!(idempotency_key(&with_key(b"")).is_err());
+        assert!(idempotency_key(&with_key("k".repeat(256).as_bytes())).is_err());
+    }
 }
 
 #[cfg(test)]

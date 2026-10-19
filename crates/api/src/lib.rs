@@ -141,6 +141,7 @@ pub fn build_router(state: AppState) -> Router {
             header::CONTENT_TYPE,
             header::ACCEPT,
             REQUEST_ID_HEADER.clone(),
+            HeaderName::from_static("idempotency-key"),
         ]);
 
     // NOTE: the body-limit layer used to be applied here, to an *empty* router — layers only

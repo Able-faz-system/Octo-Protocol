@@ -8,7 +8,7 @@
 //! green). If a URL is found but the DB is unreachable, the test fails loudly with the reason.
 
 use octo_store::{
-    NewDeposit, NewPaymentLink, NewSponsoredTx, NewWallet, NewWithdrawal, Store, StoreError,
+    IdempotencyClaim, NewDeposit, NewPaymentLink, NewSponsoredTx, NewWallet, NewWithdrawal, Store, StoreError,
     TransactionFilter,
 };
 use std::sync::Once;
@@ -1425,4 +1425,62 @@ async fn transaction_history_main_path_uses_an_index_scan() {
     let plan = plan.join("\n");
     assert!(plan.contains("idx_tx_wallet_created"), "expected index scan, got:\n{plan}");
     assert!(!plan.contains("Sort"), "keyset order must come from the index:\n{plan}");
+}
+
+#[tokio::test]
+async fn idempotency_key_claims_replays_and_rejects_mismatches() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+    let scope = "payment_link.create";
+    let key = format!("key-{}", Uuid::new_v4().simple());
+
+    assert_eq!(
+        store.claim_idempotency_key(wallet_id, scope, &key, "hash-a").await.unwrap(),
+        IdempotencyClaim::Claimed
+    );
+    // A concurrent retry before completion must not run the create again.
+    assert_eq!(
+        store.claim_idempotency_key(wallet_id, scope, &key, "hash-a").await.unwrap(),
+        IdempotencyClaim::InProgress
+    );
+
+    let response = serde_json::json!({ "id": "link-1" });
+    store
+        .complete_idempotency_key(wallet_id, scope, &key, 201, &response)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.claim_idempotency_key(wallet_id, scope, &key, "hash-a").await.unwrap(),
+        IdempotencyClaim::Replay { status_code: 201, response: response.clone() }
+    );
+    assert_eq!(
+        store.claim_idempotency_key(wallet_id, scope, &key, "hash-b").await.unwrap(),
+        IdempotencyClaim::Mismatch
+    );
+
+    // Keys are namespaced per wallet.
+    let other = fresh_wallet(&store).await;
+    assert_eq!(
+        store.claim_idempotency_key(other, scope, &key, "hash-b").await.unwrap(),
+        IdempotencyClaim::Claimed
+    );
+
+    // An expired key is reclaimed fresh, even with a different body.
+    sqlx::query("UPDATE idempotency_keys SET expires_at = now() - interval '1 second' WHERE wallet_id = $1 AND key = $2")
+        .bind(wallet_id)
+        .bind(&key)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        store.claim_idempotency_key(wallet_id, scope, &key, "hash-b").await.unwrap(),
+        IdempotencyClaim::Claimed
+    );
+
+    // A failed create releases its claim so the key can be retried.
+    store.release_idempotency_key(wallet_id, scope, &key).await.unwrap();
+    assert_eq!(
+        store.claim_idempotency_key(wallet_id, scope, &key, "hash-c").await.unwrap(),
+        IdempotencyClaim::Claimed
+    );
 }

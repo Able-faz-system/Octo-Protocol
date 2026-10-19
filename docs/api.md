@@ -141,6 +141,15 @@ deliveries (its `auto_disabled_at` is then set); unset means never.
 
 ## Payment links
 
+- `POST   /v1/wallets/{id}/payment-links` accepts an optional `Idempotency-Key` header (1-255
+  visible ASCII characters, scoped to the wallet):
+  - A retry with the same key and the **byte-identical** body returns the original `201`
+    response with `Idempotent-Replayed: true` and creates nothing new.
+  - The same key with a different body is `409`. So is a retry while the first request is
+    still running.
+  - A request that fails (e.g. `400`) frees its key, so a corrected retry can reuse it.
+  - Keys expire **24 hours** after first use (`IDEMPOTENCY_KEY_TTL_SECS`), after which the key
+    starts fresh.
 - `PATCH  /v1/wallets/{id}/payment-links/{link_id}` — edit `description`, `redirect_url` and
   `amount_usdc_stroops` (omit to keep, `null` to clear). Allowed only while no payment is
   pending or has landed; otherwise `409`. Edits are audit-logged.

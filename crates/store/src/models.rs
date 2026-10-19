@@ -369,6 +369,22 @@ pub struct PaymentLinkPayment {
     pub created_at: DateTime<Utc>,
 }
 
+/// Result of claiming an idempotency key before running a create (#453).
+#[derive(Debug, Clone, PartialEq)]
+pub enum IdempotencyClaim {
+    /// First use (or the previous use expired): the caller runs the operation, then completes.
+    Claimed,
+    /// A finished request with the same body: replay this response instead of re-running.
+    Replay {
+        status_code: u16,
+        response: serde_json::Value,
+    },
+    /// The key was already used with a different request body.
+    Mismatch,
+    /// The first request with this key has not finished yet.
+    InProgress,
+}
+
 /// A one-time email code, for signup verification or withdrawal confirmation.
 #[derive(Debug, Clone, FromRow)]
 pub struct EmailOtp {

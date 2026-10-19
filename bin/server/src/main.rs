@@ -197,7 +197,7 @@ async fn serve(cfg: Config) -> Result<()> {
         }
     });
 
-    // Hourly prune of expired deny-list entries and sessions, so neither table grows unbounded.
+    // Hourly prune of expired deny-list entries, sessions and idempotency keys (bounded tables).
     let purge_store = store.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
@@ -208,6 +208,9 @@ async fn serve(cfg: Config) -> Result<()> {
             }
             if let Err(e) = purge_store.purge_expired_sessions().await {
                 tracing::warn!(error = ?e, "failed to purge expired sessions");
+            }
+            if let Err(e) = purge_store.purge_expired_idempotency_keys().await {
+                tracing::warn!(error = ?e, "failed to purge expired idempotency keys");
             }
         }
     });
