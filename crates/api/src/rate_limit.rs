@@ -43,6 +43,9 @@ pub const PAY_SUBMIT_WINDOW: Duration = Duration::from_secs(60);
 // Seed-backup retrieval: legitimate use is a rare new-device recovery, so keep this tight.
 pub const BACKUP_USER_LIMIT: u32 = 5;
 pub const BACKUP_USER_WINDOW: Duration = Duration::from_secs(3600);
+/// CSV history exports scan a whole wallet's ledger, so starts are capped per wallet.
+pub const CSV_EXPORT_LIMIT: u32 = 10;
+pub const CSV_EXPORT_WINDOW: Duration = Duration::from_secs(60);
 
 /// Boxed future so [`RateLimitStore`] stays object-safe without an `async-trait` dependency.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;

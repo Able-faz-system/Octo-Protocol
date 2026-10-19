@@ -20,6 +20,8 @@ tower.workspace = true
 tower-http.workspace = true
 # Needed to downcast RequestBodyLimitLayer's error to LengthLimitError (413 handling).
 http-body-util = "0.1"
+# Stream combinators for chunked response bodies (CSV export).
+futures-util = "0.3"
 tokio.workspace = true
 reqwest.workspace = true
 serde.workspace = true

@@ -1723,6 +1723,7 @@ dependencies = [
  "base64",
  "chrono",
  "dotenvy",
+ "futures-util",
  "hex",
  "hmac",
  "http-body-util",

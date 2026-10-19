@@ -8,6 +8,7 @@ pub mod sessions;
 pub mod sponsor;
 pub mod sponsorship;
 pub mod submit;
+pub mod transactions_csv;
 pub mod trustlines;
 pub mod uploads;
 pub mod wallets;

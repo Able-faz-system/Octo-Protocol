@@ -67,6 +67,15 @@ decrypt. Consequently:
   and `to` (exclusive) as RFC 3339 timestamps or `YYYY-MM-DD` (midnight UTC). Any invalid value,
   or `from` not earlier than `to`, is `400`. A `before` cursor from another wallet yields an empty
   page.
+- `GET  /v1/wallets/{id}/transactions.csv` — the same history as an accounting CSV download
+  (`text/csv`, `Content-Disposition: attachment`, `Cache-Control: no-store`). Same auth and the
+  same filters as the JSON endpoint, but no pagination: rows stream newest first in batches of
+  500, so memory is bounded however long the history is. Columns: `id, created_at, direction,
+  status, asset_code, asset_issuer, amount_stroops, source_account, destination_account,
+  stellar_tx_hash, operation_index, ledger, memo_id, address_id, reference`. Text cells starting
+  with `=`, `+`, `-`, `@`, tab or CR are prefixed with `'` so spreadsheets never evaluate them.
+  If the database fails mid-export the connection is aborted rather than ending cleanly, so a
+  partial file is never mistaken for a complete one.
 - `PATCH /v1/wallets/{id}/ingest/pause` / `PATCH /v1/wallets/{id}/ingest/resume` — stop or
   restart deposit polling for one wallet. **Dashboard JWT only**, owner-only, audit-logged.
   The ingest cursor is kept while paused, so resume continues from where polling stopped with no
@@ -181,6 +190,7 @@ Counters are shared across replicas through Postgres by default (`RATE_LIMIT_BAC
 | `/v1/pay/:slug/payments/:payment_id` | GET | Per-IP | 60 req | 60s (1m) | `PAY_STATUS_LIMIT` / `PAY_STATUS_WINDOW` |
 | `/v1/pay/:slug/signing-info` | GET | Per-IP | 60 req | 60s (1m) | `PAY_SIGNING_INFO_LIMIT` / `PAY_SIGNING_INFO_WINDOW` |
 | `/v1/pay/:slug/submit-signed` | POST | Per-IP | 20 req | 60s (1m) | `PAY_SUBMIT_LIMIT` / `PAY_SUBMIT_WINDOW` |
+| `/v1/wallets/:id/transactions.csv` | GET | Per-Wallet (`csv_export:{wallet_id}`) | 10 req | 60s (1m) | `CSV_EXPORT_LIMIT` / `CSV_EXPORT_WINDOW` |
 
 > [!NOTE]
 > **Process Note:** Any new rate limit added to the API must update this table and reference named constants in `crates/api/src/rate_limit.rs` within the same pull request.

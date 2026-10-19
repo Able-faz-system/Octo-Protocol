@@ -209,6 +209,10 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::wallets::list_transactions),
         )
         .route(
+            "/v1/wallets/:id/transactions.csv",
+            get(routes::transactions_csv::export_transactions_csv),
+        )
+        .route(
             "/v1/wallets/:id/addresses",
             post(routes::addresses::create_address).get(routes::addresses::list_addresses),
         )
