@@ -60,7 +60,13 @@ decrypt. Consequently:
 - `GET  /v1/wallets` — list your wallets (paginated).
 - `GET  /v1/wallets/{id}` — wallet details.
 - `GET  /v1/wallets/{id}/balances` — live on-chain balances.
-- `GET  /v1/wallets/{id}/transactions` — deposits + outbound transfers (paginated).
+- `GET  /v1/wallets/{id}/transactions` — deposits + outbound transfers (paginated). Optional
+  filters compose with each other and with `?before=` keyset pagination:
+  `direction` (`deposit`|`withdrawal`), `status` (`pending`|`confirmed`|`failed`), `asset`
+  (`native`/`XLM`, a code such as `USDC` for any issuer, or `CODE:ISSUER`), `from` (inclusive)
+  and `to` (exclusive) as RFC 3339 timestamps or `YYYY-MM-DD` (midnight UTC). Any invalid value,
+  or `from` not earlier than `to`, is `400`. A `before` cursor from another wallet yields an empty
+  page.
 - `PATCH /v1/wallets/{id}/ingest/pause` / `PATCH /v1/wallets/{id}/ingest/resume` — stop or
   restart deposit polling for one wallet. **Dashboard JWT only**, owner-only, audit-logged.
   The ingest cursor is kept while paused, so resume continues from where polling stopped with no

@@ -9,6 +9,7 @@
 
 use octo_store::{
     NewDeposit, NewPaymentLink, NewSponsoredTx, NewWallet, NewWithdrawal, Store, StoreError,
+    TransactionFilter,
 };
 use std::sync::Once;
 use uuid::Uuid;
@@ -1326,4 +1327,102 @@ async fn migrate_applies_cleanly_from_a_genuinely_empty_database() {
     .await;
 }
 
+}
+
+/// Record a confirmed deposit in `asset_code` for filter tests.
+async fn deposit(store: &Store, wallet_id: Uuid, asset_code: &str) {
+    let tx_hash = Uuid::new_v4().to_string();
+    store
+        .record_deposit(&NewDeposit {
+            wallet_id,
+            address_id: None,
+            asset_code: asset_code.into(),
+            asset_issuer: (asset_code != "native").then(|| "Gissuer".to_string()),
+            amount_stroops: 1_000,
+            source_account: None,
+            destination_account: None,
+            stellar_tx_hash: tx_hash.clone(),
+            operation_index: 0,
+            horizon_op_id: format!("{tx_hash}-0"),
+            ledger: None,
+            memo_id: None,
+        })
+        .await
+        .expect("deposit")
+        .expect("recorded");
+}
+
+#[tokio::test]
+async fn transaction_filters_compose_with_stable_keyset_pages() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+    for asset in ["USDC", "native", "USDC", "USDC", "native"] {
+        deposit(&store, wallet_id, asset).await;
+    }
+
+    let usdc = TransactionFilter {
+        asset_code: Some("USDC".into()),
+        status: Some("confirmed".into()),
+        direction: Some("deposit".into()),
+        ..Default::default()
+    };
+    let all = store.list_transactions_page(wallet_id, &usdc, 100, None).await.unwrap();
+    assert_eq!(all.len(), 3);
+    assert!(all.iter().all(|t| t.asset_code == "USDC"));
+
+    // Paging one row at a time under the filter visits the same rows in the same order.
+    let mut paged = Vec::new();
+    let mut before = None;
+    loop {
+        let page = store.list_transactions_page(wallet_id, &usdc, 1, before).await.unwrap();
+        let Some(last) = page.last() else { break };
+        before = Some(last.id);
+        paged.extend(page);
+    }
+    let ids = |v: &[octo_store::Transaction]| v.iter().map(|t| t.id).collect::<Vec<_>>();
+    assert_eq!(ids(&paged), ids(&all));
+
+    // A future window excludes everything; a failed-status filter matches nothing here.
+    let future = TransactionFilter {
+        from: Some(chrono::Utc::now() + chrono::Duration::days(1)),
+        ..Default::default()
+    };
+    assert!(store.list_transactions_page(wallet_id, &future, 100, None).await.unwrap().is_empty());
+    let failed = TransactionFilter { status: Some("failed".into()), ..Default::default() };
+    assert!(store.list_transactions_page(wallet_id, &failed, 100, None).await.unwrap().is_empty());
+
+    // A cursor from another wallet must not position this wallet's history.
+    let other = fresh_wallet(&store).await;
+    deposit(&store, other, "USDC").await;
+    let foreign = store
+        .list_transactions_page(other, &TransactionFilter::default(), 1, None)
+        .await
+        .unwrap()[0]
+        .id;
+    assert!(store
+        .list_transactions_page(wallet_id, &TransactionFilter::default(), 100, Some(foreign))
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn transaction_history_main_path_uses_an_index_scan() {
+    let Some(store) = store().await else { return };
+    let wallet_id = fresh_wallet(&store).await;
+    // Forbid the seq-scan fallback a tiny test table would otherwise pick, then check a plan exists.
+    let mut tx = store.pool().begin().await.unwrap();
+    sqlx::query("SET LOCAL enable_seqscan = off").execute(&mut *tx).await.unwrap();
+    let plan: Vec<String> = sqlx::query_scalar(
+        "EXPLAIN SELECT * FROM transactions WHERE wallet_id = $1
+           AND created_at >= now() - interval '30 days' AND created_at < now()
+         ORDER BY created_at DESC, id DESC LIMIT 50",
+    )
+    .bind(wallet_id)
+    .fetch_all(&mut *tx)
+    .await
+    .unwrap();
+    let plan = plan.join("\n");
+    assert!(plan.contains("idx_tx_wallet_created"), "expected index scan, got:\n{plan}");
+    assert!(!plan.contains("Sort"), "keyset order must come from the index:\n{plan}");
 }

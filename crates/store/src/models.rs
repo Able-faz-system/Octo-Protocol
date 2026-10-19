@@ -90,6 +90,25 @@ pub struct Transaction {
     pub created_at: DateTime<Utc>,
 }
 
+/// Optional filters for listing/exporting a wallet's transactions. `None` means "any".
+///
+/// Callers validate values before building this; the store only binds them as parameters.
+#[derive(Debug, Clone, Default)]
+pub struct TransactionFilter {
+    /// `deposit` | `withdrawal`.
+    pub direction: Option<String>,
+    /// `pending` | `confirmed` | `failed`.
+    pub status: Option<String>,
+    /// `native` for XLM, otherwise a credit asset code.
+    pub asset_code: Option<String>,
+    /// Restricts a credit asset to one issuer; ignored when `asset_code` is `native`.
+    pub asset_issuer: Option<String>,
+    /// Inclusive lower bound on `created_at`.
+    pub from: Option<DateTime<Utc>>,
+    /// Exclusive upper bound on `created_at`.
+    pub to: Option<DateTime<Utc>>,
+}
+
 /// A withdrawal (payout) intent.
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct Withdrawal {

@@ -23,7 +23,7 @@ pub use error::StoreError;
 pub use models::{
     Address, ApiKey, AuditLog, DenylistedToken, EmailOtp, GasSponsorshipConfig, NewDeposit,
     NewPaymentLink, NewSponsoredTx, PaymentLink, PaymentLinkPayment, PaymentLinkUpdate, Session,
-    SponsoredTransaction, Transaction, User, Wallet, WebhookDelivery, WebhookEndpoint,
+    SponsoredTransaction, Transaction, TransactionFilter, User, Wallet, WebhookDelivery, WebhookEndpoint,
     WhitelistedAddress, Withdrawal, WithdrawalAllowlistConfig,
 };
 
@@ -1112,11 +1112,16 @@ impl Store {
         .await?)
     }
 
-    /// Paginated version of [`list_transactions`]: returns at most `limit` rows, newest first.
-    /// Pass the last page's final transaction id as `before_id` to fetch the next page.
+    /// Filtered, keyset-paginated transaction history: at most `limit` rows, newest first.
+    ///
+    /// Pass the last page's final transaction id as `before_id` to fetch the next page. The cursor
+    /// is resolved within this wallet only, and ordering is the total order `(created_at, id)`, so
+    /// pages stay stable under any filter combination — filters only narrow the set. Served by
+    /// `idx_tx_wallet_created` / `idx_tx_wallet_asset_created` (migration 0033).
     pub async fn list_transactions_page(
         &self,
         wallet_id: Uuid,
+        filter: &TransactionFilter,
         limit: i64,
         before_id: Option<Uuid>,
     ) -> Result<Vec<Transaction>, StoreError> {
@@ -1125,14 +1130,26 @@ impl Store {
             SELECT * FROM transactions
             WHERE wallet_id = $1
               AND ($2::uuid IS NULL OR (created_at, id) < (
-                    SELECT created_at, id FROM transactions WHERE id = $2
+                    SELECT created_at, id FROM transactions WHERE id = $2 AND wallet_id = $1
                   ))
+              AND ($3::text IS NULL OR direction = $3)
+              AND ($4::text IS NULL OR status = $4)
+              AND ($5::text IS NULL OR asset_code = $5)
+              AND ($6::text IS NULL OR asset_issuer = $6)
+              AND ($7::timestamptz IS NULL OR created_at >= $7)
+              AND ($8::timestamptz IS NULL OR created_at < $8)
             ORDER BY created_at DESC, id DESC
-            LIMIT $3
+            LIMIT $9
             "#,
         )
         .bind(wallet_id)
         .bind(before_id)
+        .bind(filter.direction.as_deref())
+        .bind(filter.status.as_deref())
+        .bind(filter.asset_code.as_deref())
+        .bind(filter.asset_issuer.as_deref())
+        .bind(filter.from)
+        .bind(filter.to)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;

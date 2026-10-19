@@ -26,15 +26,111 @@ pub struct ListParams {
     pub include_archived: Option<bool>,
 }
 
-/// Query parameters for `list_transactions`: supports pagination and direction filter.
+/// Pagination for `list_transactions`; filters come from [`TransactionFilterParams`].
 #[derive(Debug, Default, Deserialize)]
 pub struct TransactionListParams {
     /// Maximum rows to return (default 50, max 200).
     pub limit: Option<i64>,
     /// Cursor: return rows created before this id (exclusive).
     pub before: Option<Uuid>,
-    /// Filter by direction: deposit | withdrawal.
+}
+
+/// Transaction history filters, shared by the JSON list and the CSV export.
+#[derive(Debug, Default, Deserialize)]
+pub struct TransactionFilterParams {
+    /// deposit | withdrawal.
     pub direction: Option<String>,
+    /// pending | confirmed | failed.
+    pub status: Option<String>,
+    /// `native` (or `XLM`), a credit code such as `USDC`, or `CODE:ISSUER`.
+    pub asset: Option<String>,
+    /// Inclusive lower bound: RFC 3339 timestamp or `YYYY-MM-DD` (midnight UTC).
+    pub from: Option<String>,
+    /// Exclusive upper bound: RFC 3339 timestamp or `YYYY-MM-DD` (midnight UTC).
+    pub to: Option<String>,
+}
+
+impl TransactionFilterParams {
+    /// Validate every filter and build the store filter; any bad value is a 400.
+    pub fn validate(&self) -> Result<octo_store::TransactionFilter, ApiError> {
+        let direction = match self.direction.as_deref() {
+            None => None,
+            Some(d @ ("deposit" | "withdrawal")) => Some(d.to_string()),
+            Some(other) => {
+                return Err(ApiError::BadRequest(format!(
+                    "invalid direction filter '{other}'; valid values are: deposit, withdrawal"
+                )))
+            }
+        };
+        let status = match self.status.as_deref() {
+            None => None,
+            Some(s @ ("pending" | "confirmed" | "failed")) => Some(s.to_string()),
+            Some(other) => {
+                return Err(ApiError::BadRequest(format!(
+                    "invalid status filter '{other}'; valid values are: pending, confirmed, failed"
+                )))
+            }
+        };
+        let (asset_code, asset_issuer) = match self.asset.as_deref() {
+            None => (None, None),
+            Some(a) => parse_asset_filter(a)?,
+        };
+        let from = self.from.as_deref().map(|v| parse_bound("from", v)).transpose()?;
+        let to = self.to.as_deref().map(|v| parse_bound("to", v)).transpose()?;
+        if let (Some(f), Some(t)) = (from, to) {
+            if f >= t {
+                return Err(ApiError::BadRequest("from must be earlier than to".into()));
+            }
+        }
+        Ok(octo_store::TransactionFilter {
+            direction,
+            status,
+            asset_code,
+            asset_issuer,
+            from,
+            to,
+        })
+    }
+}
+
+/// Parse `native` / `XLM`, `CODE` or `CODE:ISSUER` into `(asset_code, asset_issuer)`.
+fn parse_asset_filter(raw: &str) -> Result<(Option<String>, Option<String>), ApiError> {
+    if raw.eq_ignore_ascii_case("native") || raw.eq_ignore_ascii_case("xlm") {
+        return Ok((Some("native".into()), None));
+    }
+    let (code, issuer) = match raw.split_once(':') {
+        Some((c, i)) => (c, Some(i)),
+        None => (raw, None),
+    };
+    if !octo_wallet_core::is_valid_asset_code(code) {
+        return Err(ApiError::BadRequest(
+            "asset must be native, a 1-12 byte asset code, or CODE:ISSUER".into(),
+        ));
+    }
+    if let Some(i) = issuer {
+        if !is_valid_account(i) {
+            return Err(ApiError::BadRequest(
+                "asset issuer must be a valid Stellar account (G...)".into(),
+            ));
+        }
+    }
+    Ok((Some(code.to_string()), issuer.map(str::to_string)))
+}
+
+/// Parse a date-range bound: RFC 3339, or a bare `YYYY-MM-DD` taken as midnight UTC.
+fn parse_bound(name: &str, raw: &str) -> Result<chrono::DateTime<chrono::Utc>, ApiError> {
+    if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Ok(ts.with_timezone(&chrono::Utc));
+    }
+    chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map(|dt| dt.and_utc())
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "{name} must be an RFC 3339 timestamp or a YYYY-MM-DD date"
+            ))
+        })
 }
 
 /// Body for wallet creation. Non-custodial: the client generates the keypair and sends only the
@@ -549,34 +645,26 @@ pub async fn get_balances(
     Ok(Envelope::ok(balances))
 }
 
-/// `GET /v1/wallets/{id}/transactions` — recorded deposits/withdrawals for a wallet,
-/// with optional `?limit=`, `?before=` cursor pagination, and `?direction=` filter.
+/// `GET /v1/wallets/{id}/transactions` — recorded deposits/withdrawals for a wallet, with
+/// `?limit=` / `?before=` keyset pagination and composable `?direction=`, `?status=`, `?asset=`,
+/// `?from=` and `?to=` filters.
 pub async fn list_transactions(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Query(q): Query<TransactionListParams>,
+    Query(f): Query<TransactionFilterParams>,
 ) -> ApiResult<Json<Envelope<TransactionListResponse>>> {
     authorize_wallet(&headers, &state, id).await?;
     let _ = state.store().get_wallet(id).await?;
 
-    let direction = match q.direction.as_deref() {
-        Some("deposit") => Some("deposit"),
-        Some("withdrawal") => Some("withdrawal"),
-        None => None,
-        Some(other) => {
-            return Err(ApiError::BadRequest(format!(
-                "invalid direction filter '{other}'; valid values are: deposit, withdrawal"
-            )));
-        }
-    };
-
+    let filter = f.validate()?;
     let limit = validated_limit(q.limit)?;
 
     // Fetch limit+1 to detect whether a next page exists.
     let rows = state
         .store()
-        .list_transactions_page(id, limit + 1, direction, q.before)
+        .list_transactions_page(id, &filter, limit + 1, q.before)
         .await
         .map_err(|_| ApiError::Internal)?;
 
@@ -746,6 +834,65 @@ pub fn ensure_wallet_not_archived(wallet: &octo_store::Wallet) -> ApiResult<()> 
         return Err(ApiError::Forbidden("wallet is archived".into()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod transaction_filter_tests {
+    use super::*;
+
+    const ISSUER: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+
+    fn params() -> TransactionFilterParams {
+        TransactionFilterParams::default()
+    }
+
+    #[test]
+    fn filters_compose() {
+        let f = TransactionFilterParams {
+            direction: Some("deposit".into()),
+            status: Some("confirmed".into()),
+            asset: Some(format!("USDC:{ISSUER}")),
+            from: Some("2026-01-01".into()),
+            to: Some("2026-02-01T00:00:00Z".into()),
+        }
+        .validate()
+        .unwrap();
+        assert_eq!(f.direction.as_deref(), Some("deposit"));
+        assert_eq!(f.status.as_deref(), Some("confirmed"));
+        assert_eq!(f.asset_code.as_deref(), Some("USDC"));
+        assert_eq!(f.asset_issuer.as_deref(), Some(ISSUER));
+        assert!(f.from.unwrap() < f.to.unwrap());
+    }
+
+    #[test]
+    fn native_aliases_map_to_native_without_issuer() {
+        for raw in ["native", "XLM", "xlm"] {
+            let f = TransactionFilterParams { asset: Some(raw.into()), ..params() }
+                .validate()
+                .unwrap();
+            assert_eq!(f.asset_code.as_deref(), Some("native"));
+            assert!(f.asset_issuer.is_none());
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_values() {
+        let bad = [
+            TransactionFilterParams { status: Some("settled".into()), ..params() },
+            TransactionFilterParams { direction: Some("in".into()), ..params() },
+            TransactionFilterParams { asset: Some("TOOLONGASSETCODE".into()), ..params() },
+            TransactionFilterParams { asset: Some("USDC:not-a-key".into()), ..params() },
+            TransactionFilterParams { from: Some("yesterday".into()), ..params() },
+            TransactionFilterParams {
+                from: Some("2026-02-01".into()),
+                to: Some("2026-01-01".into()),
+                ..params()
+            },
+        ];
+        for p in bad {
+            assert!(p.validate().is_err(), "{p:?} should be rejected");
+        }
+    }
 }
 
 #[cfg(test)]
