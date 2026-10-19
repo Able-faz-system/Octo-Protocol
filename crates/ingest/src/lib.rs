@@ -752,6 +752,7 @@ impl Supervisor {
         self.expire_stale_payment_link_payments().await;
         let page_limit = page_limit.clamp(1, Self::MAX_HORIZON_PAGE_LIMIT);
 
+        // Paused wallets (#450) are excluded by the query and keep their cursor for resume.
         // Only wallets actually due under the backoff tiers — a dev/production DB accumulates
         // wallets that never transact again, and polling them every cycle starves the active ones
         // of the shared concurrency budget. Paged by id so memory doesn't scale with wallet count.

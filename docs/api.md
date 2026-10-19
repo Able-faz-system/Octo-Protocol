@@ -61,6 +61,11 @@ decrypt. Consequently:
 - `GET  /v1/wallets/{id}` — wallet details.
 - `GET  /v1/wallets/{id}/balances` — live on-chain balances.
 - `GET  /v1/wallets/{id}/transactions` — deposits + outbound transfers (paginated).
+- `PATCH /v1/wallets/{id}/ingest/pause` / `PATCH /v1/wallets/{id}/ingest/resume` — stop or
+  restart deposit polling for one wallet. **Dashboard JWT only**, owner-only, audit-logged.
+  The ingest cursor is kept while paused, so resume continues from where polling stopped with no
+  gap; a pause takes effect from the supervisor's next tick. Wallet views expose
+  `ingest_paused` and `ingest_paused_at`.
 - `GET  /v1/wallets/{id}/backup` — the opaque client-encrypted backup blob, for new-device
   recovery. **Dashboard JWT only.** Useless without the user's password. Rate-limited to 5
   requests per hour per user (`429` beyond that); every successful read writes an audit row, and

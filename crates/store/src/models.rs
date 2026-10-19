@@ -38,6 +38,9 @@ pub struct Wallet {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub archived_at: Option<DateTime<Utc>>,
+    /// When true the ingest supervisor skips this wallet; its cursor is left untouched.
+    pub ingest_paused: bool,
+    pub ingest_paused_at: Option<DateTime<Utc>>,
 }
 
 impl Wallet {

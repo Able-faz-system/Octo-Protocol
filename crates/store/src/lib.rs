@@ -699,6 +699,8 @@ impl Store {
             SELECT w.* FROM wallets w
             LEFT JOIN ingest_cursor c ON c.wallet_id = w.id
             WHERE w.network = $1
+              -- Paused wallets are never polled; their cursor waits untouched for a resume.
+              AND w.ingest_paused = false
               AND ($6::uuid IS NULL OR w.id > $6)
               -- Never polled, or never saw activity => always due.
               AND (
@@ -750,6 +752,36 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Pause or resume ingestion for a wallet, returning the updated row.
+    ///
+    /// Only the flag changes — `ingest_cursor` is deliberately left alone so a resume picks up
+    /// from the saved paging token with no gap. `ingest_paused_at` keeps the first pause time
+    /// on a repeated pause and is cleared on resume.
+    pub async fn set_ingest_paused(
+        &self,
+        wallet_id: Uuid,
+        paused: bool,
+    ) -> Result<Wallet, StoreError> {
+        sqlx::query_as::<_, Wallet>(
+            r#"
+            UPDATE wallets SET
+                ingest_paused = $2,
+                ingest_paused_at = CASE
+                    WHEN $2 THEN COALESCE(ingest_paused_at, now())
+                    ELSE NULL
+                END,
+                updated_at = now()
+            WHERE id = $1
+            RETURNING *
+            "#,
+        )
+        .bind(wallet_id)
+        .bind(paused)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)
     }
 
     /// Fetch a wallet by id.

@@ -229,6 +229,9 @@ pub struct WalletView {
     pub label: Option<String>,
     pub description: Option<String>,
     pub archived_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// True while deposit ingestion is paused for this wallet.
+    pub ingest_paused: bool,
+    pub ingest_paused_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Paginated list response for wallets.
@@ -600,6 +603,8 @@ fn to_view(w: octo_store::Wallet) -> WalletView {
         label: w.label,
         description: w.description,
         archived_at: w.archived_at,
+        ingest_paused: w.ingest_paused,
+        ingest_paused_at: w.ingest_paused_at,
     }
 }
 
@@ -684,6 +689,57 @@ pub async fn unarchive_wallet(
     Ok(Envelope::ok(to_view(updated)))
 }
 
+/// `PATCH /v1/wallets/:id/ingest/pause` — stop polling this wallet (dashboard login only).
+///
+/// The saved cursor is kept, so deposits that land while paused are picked up on resume. Takes
+/// effect from the supervisor's next tick; a page already in flight still finishes.
+pub async fn pause_ingest(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Envelope<WalletView>>> {
+    set_ingest_paused(state, id, headers, true).await
+}
+
+/// `PATCH /v1/wallets/:id/ingest/resume` — resume polling from the saved cursor.
+pub async fn resume_ingest(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Envelope<WalletView>>> {
+    set_ingest_paused(state, id, headers, false).await
+}
+
+/// Shared pause/resume body: owner-only, API keys rejected, every change audit-logged.
+async fn set_ingest_paused(
+    state: AppState,
+    id: Uuid,
+    headers: HeaderMap,
+    paused: bool,
+) -> ApiResult<Json<Envelope<WalletView>>> {
+    // A leaked API key must not be able to silence deposit detection, so login only.
+    let user_id = crate::auth::require_login(&headers, &state).await?;
+    let wallet = state.store().get_wallet(id).await?;
+    if wallet.user_id != Some(user_id) {
+        return Err(ApiError::NotFound);
+    }
+    let updated = state.store().set_ingest_paused(id, paused).await?;
+    crate::audit::record(
+        &state,
+        user_id,
+        if paused {
+            "paused deposit ingestion"
+        } else {
+            "resumed deposit ingestion"
+        },
+        crate::audit::category::WALLET,
+        Some(&id.to_string()),
+        &headers,
+    )
+    .await;
+    Ok(Envelope::ok(to_view(updated)))
+}
+
 /// Guard check ensuring a wallet is not archived before executing a mutating operation.
 pub fn ensure_wallet_not_archived(wallet: &octo_store::Wallet) -> ApiResult<()> {
     if wallet.is_archived() {
@@ -706,6 +762,9 @@ mod tests {
             custody: "client".into(),
             label: None,
             description: None,
+            archived_at: None,
+            ingest_paused: false,
+            ingest_paused_at: None,
         };
         let responses = [
             serde_json::to_string(&CreateWalletResponse {
